@@ -170,6 +170,10 @@ Up to 250 events are stored locally. The exported report excludes prompts, answe
 
 If the AI has replied, capture and answer validation run separately: an incomplete answer set reports the missing question numbers instead of waiting until the full response timeout. Hidden or disabled Stop buttons do not block capture. Tabs opened before an extension update are reconnected when a run starts.
 
+ChatGPT input detection supports the composer without `#prompt-textarea` and assistant messages marked by `data-conversation-role`. Editor discovery uses the selected task timeout. `dom_snapshot` records editor and response counts without their contents. Provider errors are logged as `provider_error`; `answer_received` is reserved for returned response data. Stop cancels the quiz before submission even when the response has just arrived.
+
+Repeated page `ResizeObserver` warnings appear once as a warning, so they cannot fill the debug log during response streaming.
+
 ---
 
 ## How It Feels to Use
@@ -627,5 +631,5 @@ Coursera Quiz AI Solver is an independent open-source browser extension. It is n
 Fork: https://github.com/irrumi/coursera-quiz-ai-solver
 Upstream: https://github.com/aburahatsabir/coursera-quiz-ai-solver
 Source ZIP: https://github.com/irrumi/coursera-quiz-ai-solver/archive/refs/heads/main.zip
-Version: 6.1.3 (unpacked extension)
+Version: 6.1.4 (unpacked extension)
 ```

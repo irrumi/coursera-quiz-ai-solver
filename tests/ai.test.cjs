@@ -6,6 +6,7 @@ const { test } = require('node:test');
 
 const project = path.resolve(__dirname, '..');
 const read = name => fs.readFileSync(path.join(project, name), 'utf8');
+const extensionVersion = JSON.parse(read('manifest.json')).version;
 const flush = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
 
 function harness(extra = {}) {
@@ -61,7 +62,7 @@ function harness(extra = {}) {
             storage: { local: storage(local, 'local'), sync: storage(sync, 'sync'), onChanged: {
                 addListener: fn => listeners.push(fn), removeListener: fn => { const index = listeners.indexOf(fn); if (index >= 0) listeners.splice(index, 1); },
             } },
-            runtime: { onMessage: { addListener() {} }, getManifest: () => ({ version: '6.1.3' }),
+            runtime: { onMessage: { addListener() {} }, getManifest: () => ({ version: extensionVersion }),
                 sendMessage: async () => ({ ok: true }) },
         },
         ...extra,
@@ -196,13 +197,16 @@ for (const provider of ['chatgpt', 'claude']) {
     test(`${provider} bridge saves the entire late response after a ${scenario}`, async () => {
         let processing = false, responseText = '';
         const responses = [];
-        const input = { tagName: provider === 'chatgpt' ? 'TEXTAREA' : 'DIV', className: 'tiptap', id: 'prompt-textarea',
-            innerText: '', value: '', focus() {}, dispatchEvent() {} };
+        const input = { tagName: 'DIV', className: 'ProseMirror', id: 'prompt-textarea',
+            innerText: '', value: '', focus() {}, dispatchEvent() {}, getAttribute: () => null, closest: selector => selector === 'form' ? document : null };
         const document = {
             body: { appendChild() {} },
             createElement: () => ({ style: {}, remove() {} }),
             execCommand: (command, _, text) => { if (command === 'insertText') input.innerText = text; return true; },
-            querySelectorAll: selector => selector.startsWith('button[')
+            querySelectorAll: selector => selector === 'button' ? [send]
+                : provider === 'chatgpt' && /prompt-textarea|data-composer-markdown/.test(selector) ? [input]
+                : selector === '[data-conversation-role="assistant"]' ? []
+                : selector.startsWith('button[')
                 ? processing ? [{ getAttribute: name => name === 'data-testid' ? 'stop-button' : name === 'aria-label' ? 'Stop generating' : null }] : []
                 : responses,
             querySelector: selector => {
@@ -214,7 +218,7 @@ for (const provider of ['chatgpt', 'claude']) {
         const h = harness({ document });
         const answer = 'Full answer } with "quotes" and markup <tag>\n'.repeat(1200);
         const complete = JSON.stringify({ answers: [{ q: 1, a: [answer] }] });
-        const send = { disabled: false, click() {
+        const send = { disabled: false, getAttribute: key => key === 'data-testid' ? 'send-button' : null, click() {
             processing = true;
             h.context.setTimeout(() => {
                 const draft = '{"answers":[{"q":1,"a":["draft"]}]}';
@@ -240,7 +244,7 @@ for (const provider of ['chatgpt', 'claude']) {
   }
 }
 
-function contentHarness() {
+function contentHarness(overrides = {}) {
     const messages = [], statuses = [];
     let submitted = 0, pledged = 0;
     const h = harness({
@@ -259,6 +263,7 @@ function contentHarness() {
         submitQuiz: async () => { submitted++; return true; },
         clearState: async () => {},
         setStatus: message => statuses.push(message),
+        ...overrides,
     };
     const source = read('content.js');
     const index = source.lastIndexOf('})();');
@@ -267,7 +272,7 @@ function contentHarness() {
         checkHonorCode = testDeps.checkHonorCode; submitQuiz = testDeps.submitQuiz;
         clearState = testDeps.clearState; setStatus = testDeps.setStatus;
         findBlocks = testDeps.findBlocks;
-        globalThis.contentHooks = { autoSolveAndSubmit, autoSelect, reconcileSubmission, advanceQuiz, collectQuizzes, startPipeline, invalidAnswerQuestions };\n`;
+        globalThis.contentHooks = { autoSolveAndSubmit, autoSelect, reconcileSubmission, advanceQuiz, collectQuizzes, startPipeline, invalidAnswerQuestions, requestStop: () => { stopRequested = true; } };\n`;
     vm.runInContext(source.slice(0, index) + hooks + source.slice(index), h.context);
     return { ...h, messages, statuses, submitted: () => submitted, pledged: () => pledged };
 }
@@ -287,6 +292,22 @@ test('single-page action does not submit after provider failure', async () => {
     await flush();
     assert.equal(h.submitted(), 0);
     assert.equal(h.pledged(), 0);
+});
+
+test('Stop during answer capture prevents pledge and submission', async () => {
+    let h;
+    h = contentHarness({ solveWithSelectedProvider: async () => { h.context.contentHooks.requestStop(); return true; } });
+    await h.context.contentHooks.autoSolveAndSubmit({ quizUrls: ['test'], currentIndex: 0 });
+    assert.equal(h.pledged(), 0);
+    assert.equal(h.submitted(), 0);
+});
+
+test('Stop during the delay before Submit prevents submission', async () => {
+    let h;
+    h = contentHarness({ solveWithSelectedProvider: async () => true,
+        delay: async ms => { if (ms === 600) h.context.contentHooks.requestStop(); } });
+    await h.context.contentHooks.autoSolveAndSubmit({ quizUrls: ['test'], currentIndex: 0 });
+    assert.equal(h.submitted(), 0);
 });
 
 test('long textarea answers are restored in full if insertText silently truncates them', () => {
@@ -359,6 +380,34 @@ test('numeric and scalar text answers are normalized without losing long text', 
     assert.equal(api.hasCompleteAnswers(normalized, 2), true);
 });
 
+test('ChatGPT editor discovery waits beyond sixty seconds and cancels without sending', async () => {
+    const h = harness({ document: { readyState: 'complete', querySelectorAll: () => [] } });
+    h.local.cqsChatGptTask = { taskId: 'late-editor', prompt: 'Test prompt', deadline: 300000 };
+    vm.runInContext(read('chatgpt_bridge.js'), h.context);
+    await h.advance(70000);
+    assert.equal(h.local.cqsChatGptAnswers, undefined);
+    assert.equal(h.local.cqsChatGptProgress.stage, 'finding_editor');
+    await h.context.chrome.storage.local.remove(['cqsChatGptTask']);
+    await h.advance(1000);
+    assert.equal(h.local.cqsChatGptAnswers, undefined);
+    assert.equal(h.timers.size, 0);
+});
+
+test('repeated page layout warnings cannot flood out useful debug events', () => {
+    const handlers = {}, events = [];
+    const h = harness({ addEventListener: (name, handler) => { handlers[name] = handler; } });
+    h.context.chrome.runtime.sendMessage = message => { events.push(message.entry); return Promise.resolve({ ok: true }); };
+    vm.runInContext(read('diagnostics.js'), h.context);
+    h.context.CqsDebug.attach('chatgpt');
+    for (let i = 0; i < 300; i++) handlers.error({ message: 'ResizeObserver loop completed with undelivered notifications.' });
+    handlers.error({ message: 'Actual bridge failure' });
+    assert.equal(events.length, 2);
+    assert.equal(events[0].event, 'page_layout_warning');
+    assert.equal(events[0].level, 'warn');
+    assert.equal(events[1].event, 'script_error');
+    assert.equal(events[1].level, 'error');
+});
+
 test('a complete response envelope is accepted even if a question is missing', () => {
     const { api } = harness();
     assert.equal(api.hasCompleteResponseEnvelope('{"answers":[{"q":1,"a":["A"]}]}'), true);
@@ -417,7 +466,7 @@ test('background targets one AI tab and reconnects an already-open tab missing t
     h.context.chrome.tabs = {
         query: async () => [{ id: 1, windowId: 7 }, { id: 2, windowId: 7, active: true }],
         update: async () => {}, get: async () => ({ status: 'complete' }),
-        sendMessage: async () => { if (!injected) throw new Error('Receiving end does not exist'); return { ok: true, version: '6.1.3' }; },
+        sendMessage: async () => { if (!injected) throw new Error('Receiving end does not exist'); return { ok: true, version: extensionVersion }; },
     };
     h.context.chrome.windows = { update: async () => {} };
     h.context.chrome.scripting = { executeScript: async spec => { injected = true; files.push(...spec.files); } };

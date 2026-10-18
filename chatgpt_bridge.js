@@ -48,38 +48,20 @@
 
         console.log('[QuizAI Bridge] ✅ Task found. Prompt length:', task.prompt.length);
 
-        // ── 2. Wait for the editor to be fully hydrated ───────────────────────
-        await delay(2500); // ChatGPT React takes a moment to mount
-
-        const inputEl = await waitForEl([
-            '#prompt-textarea',
-            'textarea[data-id="root"]',
-            'div[contenteditable="true"]#prompt-textarea'
-        ], 20000);
+        // Use the task's selected deadline, including React hydration.
+        globalThis.CqsDebug?.log('chatgpt', 'dom_snapshot', { taskId: task.taskId, ...CqsAI.chatGptDomStatus() });
+        const inputEl = await waitForElement(() => CqsAI.findChatGptEditor(), deadline);
+        if (activeTaskId !== task.taskId) return;
 
         if (!inputEl) {
-            await storeError('ChatGPT input not found. Make sure you are logged into chatgpt.com');
+            await storeError('ChatGPT editor not found before the selected timeout. Check the chat tab and open Debug.', 'EDITOR_NOT_FOUND');
             return;
         }
 
         console.log('[QuizAI Bridge] Input found:', inputEl.tagName, inputEl.id);
 
         // ── 3. Snapshot baseline BEFORE sending ──────────────────────────────────────
-        const RESPONSE_SELS = [
-            '[data-message-author-role="assistant"]',
-            '[data-turn="assistant"]'
-        ];
-
-        function getAllResponseEls() {
-            for (const sel of RESPONSE_SELS) {
-                const all = document.querySelectorAll(sel);
-                const visible = [...all].filter(CqsAI.isVisible);
-                if (visible.length > 0) return visible;
-            }
-            return [];
-        }
-
-        const readResponse = CqsAI.createResponseTracker(getAllResponseEls);
+        const readResponse = CqsAI.createResponseTracker(() => CqsAI.getChatGptResponses());
         await updateProgress('inserting_prompt');
 
         // ── 4. Paste question screenshots (for vision/image questions) ────────────
@@ -95,7 +77,7 @@
 
         if (inputEl.tagName.toLowerCase() === 'textarea') {
             // For normal textarea
-            inputEl.value = task.prompt;
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(inputEl, task.prompt);
             inputEl.dispatchEvent(new Event('input', { bubbles: true }));
         } else {
             // For contenteditable
@@ -112,7 +94,7 @@
             }
 
             if (!(inputEl.innerText || '').trim()) {
-                inputEl.innerHTML = '<p>' + task.prompt.replace(/\n\n/g, '</p><p>').replace(/\n/g, '<br>') + '</p>';
+                inputEl.textContent = task.prompt;
                 inputEl.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText' }));
             }
         }
@@ -122,23 +104,18 @@
         // ── 6. Click Send ────────────────────────────────────────────────────────────
         await delay(800); // let React enable the Send button
 
-        const sendBtn = await waitForEl([
-            'button[data-testid="send-button"]',
-            'button[aria-label="Send message"]'
-        ], 5000);
+        const sendBtn = await waitForElement(() => CqsAI.findChatGptSendButton(inputEl), Math.min(deadline, Date.now() + 15000));
 
         if (activeTaskId !== task.taskId) return;
         if (Date.now() >= deadline) { await storeError('Task expired before sending. Try again.'); return; }
         await updateProgress('sending_prompt');
 
-        if (sendBtn && !sendBtn.disabled) {
+        if (sendBtn) {
             console.log('[QuizAI Bridge] Clicking Send...');
             sendBtn.click();
         } else {
-            console.warn('[QuizAI Bridge] Send button not found — pressing Enter');
-            inputEl.dispatchEvent(new KeyboardEvent('keydown', {
-                key: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true
-            }));
+            await storeError('ChatGPT Send button was not available. The prompt remains in the editor; it was not sent.', 'SEND_BUTTON_NOT_FOUND');
+            return;
         }
 
         console.log('[QuizAI Bridge] Message sent. Waiting for NEW response elements...');
@@ -193,21 +170,13 @@
         //  HELPERS
         // ──────────────────────────────────────────────────────────────────────────────
 
-        function waitForEl(sels, maxMs) {
-            return new Promise(resolve => {
-                for (const sel of sels) {
-                    const el = document.querySelector(sel);
-                    if (el) { resolve(el); return; }
-                }
-                const start = Date.now();
-                const id = setInterval(() => {
-                    for (const sel of sels) {
-                        const el = document.querySelector(sel);
-                        if (el) { clearInterval(id); resolve(el); return; }
-                    }
-                    if (Date.now() - start > maxMs) { clearInterval(id); resolve(null); }
-                }, 400);
-            });
+        async function waitForElement(find, until) {
+            while (activeTaskId === task.taskId && Date.now() < until) {
+                const element = find();
+                if (element) return element;
+                await delay(Math.min(400, until - Date.now()));
+            }
+            return null;
         }
 
         // Paste base64 screenshots into ChatGPT's input as image attachments
@@ -325,11 +294,11 @@
             return { answers: [], uploadFileSvg: null };
         }
 
-        async function storeError(msg) {
+        async function storeError(msg, code = 'BRIDGE_ERROR') {
             if (activeTaskId !== task.taskId) return;
-            await updateProgress('error', { message: msg });
+            await updateProgress('error', { message: msg, code, ...CqsAI.chatGptDomStatus() });
             console.error('[QuizAI Bridge] ERROR:', msg);
-            await chrome.storage.local.set({ [ANSWER_KEY]: { error: msg, taskId: task.taskId, timestamp: Date.now() } });
+            await chrome.storage.local.set({ [ANSWER_KEY]: { error: msg, code, taskId: task.taskId, timestamp: Date.now() } });
             await chrome.storage.local.remove([TASK_KEY]);
             showBanner('⚠ Quiz AI: ' + msg);
         }

@@ -14,7 +14,7 @@ const artifacts = path.join(root, 'test-artifacts');
         const page = await context.newPage();
         const errors = [];
         page.on('pageerror', error => errors.push(error.message));
-        await page.addInitScript(() => {
+        await page.addInitScript(({ version }) => {
             const changeListeners = [];
             const area = key => ({
                 async get(keys, callback) {
@@ -44,7 +44,7 @@ const artifacts = path.join(root, 'test-artifacts');
                 storage: { sync: area('sync'), local: area('local'), onChanged: {
                     addListener: fn => changeListeners.push(fn), removeListener: fn => { const index = changeListeners.indexOf(fn); if (index >= 0) changeListeners.splice(index, 1); },
                 } },
-                runtime: { onMessage: { addListener() {} }, getManifest: () => ({ version: '6.1.3' }),
+                runtime: { onMessage: { addListener() {} }, getManifest: () => ({ version }),
                     async sendMessage(message) {
                         window.runtimeMessages.push(message.type);
                         if (['OPEN_CHATGPT_TAB', 'OPEN_CLAUDE_TAB'].includes(message.type) && localStorage.getItem('fixtureMode') === 'flow') {
@@ -67,17 +67,27 @@ const artifacts = path.join(root, 'test-artifacts');
                 tabs: {
                     async query(_, callback) { const tabs = [{ id: 1, url: window.activeUrl }]; callback?.(tabs); return tabs; },
                     async sendMessage(_, message, callback) {
-                        const reply = message.type === 'CQS_CONTENT_PING' ? window.forceContentMissing ? null : { ok: true, version: '6.1.3' } : { ok: true };
+                        const reply = message.type === 'CQS_CONTENT_PING' ? window.forceContentMissing ? null : { ok: true, version } : { ok: true };
                         if (message.type !== 'CQS_CONTENT_PING') window.sentMessages.push(message);
                         callback?.(reply); return reply;
                     },
                 },
                 scripting: { async executeScript(spec) { window.injectedScripts.push(...spec.files); window.forceContentMissing = false; } },
             };
-        });
+        }, { version: JSON.parse(fs.readFileSync(path.join(root, 'manifest.json'), 'utf8')).version });
         await page.route('**/*', async route => {
             const url = new URL(route.request().url());
             if (url.hostname !== 'extension.test') return route.abort();
+            if (url.pathname === '/provider.html') {
+                return route.fulfill({ contentType: 'text/html', body: `<html><body>
+                  <textarea id="prompt-textarea" style="display:none"></textarea>
+                  <div data-content-search-unit-key="old" data-chatgpt-search-message-ids="old"><h4 data-conversation-role="assistant">ChatGPT said:</h4><div>Old response</div></div>
+                  <form data-chatgpt-composer oninput="this.querySelector('button').disabled=false" onsubmit="event.preventDefault();window.providerSent=true;document.querySelector('[data-composer-markdown]').textContent='';const turn=document.createElement('div');turn.dataset.talvtTurnState='streaming';turn.innerHTML='<div data-content-search-unit-key=new data-chatgpt-search-message-ids=new><h4 data-conversation-role=assistant>ChatGPT said:</h4><div id=response></div></div>';document.body.appendChild(turn);document.querySelector('#response').textContent=JSON.stringify({answers:[{q:1,a:['draft']}]});setTimeout(()=>{document.querySelector('#response').textContent=JSON.stringify({answers:[{q:1,a:['Long final answer with &lt;literal&gt; markup and braces }\\n'.repeat(1500)]}]});turn.dataset.talvtTurnState='complete'},4200)">
+                    <div class="ProseMirror" role="textbox" contenteditable="true" data-composer-markdown></div>
+                    <button type="submit" aria-label="Отправить" disabled>Send</button>
+                  </form><script src="/ai_common.js"></script><script src="/diagnostics.js"></script><script src="/chatgpt_bridge.js"></script>
+                  </body></html>` });
+            }
             if (url.pathname === '/idle.html') return route.fulfill({ contentType: 'text/html', body: '<html><body>Next quiz destination reached.</body></html>' });
             if (url.pathname === '/learn/test/quiz/flow') {
                 return route.fulfill({ contentType: 'text/html', body: `<html><head></head><body><main>
@@ -220,8 +230,25 @@ const artifacts = path.join(root, 'test-artifacts');
         assert.equal(flow.submission?.clicks, 1, 'submission must only be clicked once');
         assert.equal(flow.data.cqsAutoState.currentIndex, 1);
         assert.equal(flow.data.cqsLastQueue.results[0].status, 'completed');
+
+        // Reproduce the observed GPT layout: no prompt id, role on a heading,
+        // Russian Send label and a complete-looking draft while still streaming.
+        await page.evaluate(() => localStorage.clear());
+        await page.goto('https://extension.test/provider.html');
+        assert.equal(await page.evaluate(() => CqsAI.findChatGptEditor()?.getAttribute('data-composer-markdown')), '');
+        await page.evaluate(async () => {
+            await chrome.storage.local.set({ cqsChatGptTask: { taskId: 'new-layout', prompt: 'A literal <script> marker and a question', expectedAnswers: 1, deadline: Date.now() + 30000 } });
+        });
+        const providerHandle = await page.waitForFunction(() => {
+            const data = JSON.parse(localStorage.getItem('local') || '{}').cqsChatGptAnswers;
+            return data?.taskId === 'new-layout' ? data : false;
+        }, null, { timeout: 25000 });
+        const providerResult = await providerHandle.jsonValue();
+        assert.equal(providerResult.error, undefined);
+        assert.equal(providerResult.answers[0].a[0], 'Long final answer with <literal> markup and braces }\n'.repeat(1500));
+        assert.equal(await page.evaluate(() => window.providerSent), true);
         assert.deepEqual(errors, []);
-        console.log('Browser smoke passed: provider choice/reconnection, quiz scan/routing, Debug export, long answers, full queue flow with a stubbed AI response and confirmed submission.');
+        console.log('Browser smoke passed: provider settings, quiz scan/queue, Debug export, long answers, full ChatGPT bridge with observed composer/response markup and streaming guard (synthetic fixtures).');
     } finally {
         await browser.close();
     }

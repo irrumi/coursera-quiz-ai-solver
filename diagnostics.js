@@ -1,7 +1,7 @@
 (function (root) {
     'use strict';
     const LOG_KEY = 'cqsDebugLog';
-    const allowed = new Set(['taskId', 'timestamp', 'provider', 'stage', 'code', 'message', 'characters', 'answers', 'expected', 'missing', 'total', 'completed', 'pending', 'failed', 'locked', 'unknown', 'waiting', 'index', 'tabId', 'version', 'phase']);
+    const allowed = new Set(['taskId', 'timestamp', 'provider', 'stage', 'code', 'message', 'characters', 'answers', 'expected', 'missing', 'total', 'completed', 'pending', 'failed', 'locked', 'unknown', 'waiting', 'index', 'tabId', 'version', 'phase', 'readyState', 'editorFound', 'visibleEditors', 'responseNodes']);
     let writes = Promise.resolve();
     function sanitize(details = {}) {
         return Object.fromEntries(Object.entries(details).filter(([key, value]) => allowed.has(key) && ['string', 'number', 'boolean'].includes(typeof value))
@@ -26,8 +26,17 @@
         } catch { /* The console still shows errors after an extension reload. */ }
     }
     function attach(source) {
+        let layoutWarningReported = false;
         root.addEventListener?.('unhandledrejection', event => log(source, 'unhandled_rejection', { message: event.reason?.message || String(event.reason) }, 'error'));
-        root.addEventListener?.('error', event => log(source, 'script_error', { message: event.message || 'Script error' }, 'error'));
+        root.addEventListener?.('error', event => {
+            const message = event.message || 'Script error';
+            if (/^ResizeObserver loop (?:completed with undelivered notifications|limit exceeded)\.?$/.test(message)) {
+                if (!layoutWarningReported) log(source, 'page_layout_warning', { message: 'ResizeObserver layout warning; repeated warnings suppressed.' }, 'warn');
+                layoutWarningReported = true;
+                return;
+            }
+            log(source, 'script_error', { message }, 'error');
+        });
     }
     async function report() {
         const data = await chrome.storage.local.get([LOG_KEY, 'cqsQuizScan', 'cqsAutoState', 'cqsLastQueue', 'cqsChatGptProgress', 'cqsClaudeProgress']);

@@ -101,18 +101,52 @@
         return true;
     }
 
+    function findChatGptEditor(doc = root.document) {
+        for (const selector of ['[data-chatgpt-composer] [data-composer-markdown][contenteditable="true"]',
+            '#prompt-textarea', 'textarea[data-id="root"]', 'form .ProseMirror[contenteditable="true"][role="textbox"]']) {
+            const editor = [...doc.querySelectorAll(selector)].find(el => isVisible(el) && !el.disabled && !el.readOnly && el.getAttribute('aria-disabled') !== 'true');
+            if (editor) return editor;
+        }
+        return null;
+    }
+
+    function getChatGptResponses(doc = root.document) {
+        const nodes = [...doc.querySelectorAll('[data-message-author-role="assistant"], [data-turn="assistant"]')];
+        // In the newer chat layout the role is on a screen-reader heading.
+        // Its parent contains only that assistant message, not the user prompt.
+        for (const heading of doc.querySelectorAll('[data-conversation-role="assistant"]')) {
+            const message = heading.closest('[data-content-search-unit-key], [data-chatgpt-search-unit-key]');
+            if (message && !nodes.includes(message)) nodes.push(message);
+        }
+        return nodes.filter(isVisible);
+    }
+
+    function findChatGptSendButton(editor, doc = root.document) {
+        const scope = editor?.closest('form') || doc;
+        return [...scope.querySelectorAll('button')].find(button => isVisible(button) && !button.disabled && button.getAttribute('aria-disabled') !== 'true' &&
+            (['send-button', 'composer-send-button'].includes(button.getAttribute('data-testid')) || button.id === 'composer-submit-button' ||
+                /^(send|send message|send prompt|отправить|отправить сообщение)$/i.test((button.getAttribute('aria-label') || '').trim()) || button.type === 'submit')) || null;
+    }
+
+    function chatGptDomStatus(doc = root.document) {
+        return { readyState: doc.readyState, editorFound: !!findChatGptEditor(doc),
+            visibleEditors: [...doc.querySelectorAll('textarea, [contenteditable="true"]')].filter(isVisible).length,
+            responseNodes: getChatGptResponses(doc).length };
+    }
+
     // React can update a response in place, or remount old messages with new nodes.
     // Track both identity and text so either case is handled without reading an old reply.
     function createResponseTracker(getElements) {
         const initial = getElements();
         const textOf = el => (el.innerText || el.textContent || '').trim();
         const nodes = new Map(initial.map(el => [el, textOf(el)]));
-        const ids = new Map(initial.map(el => [el.getAttribute('data-message-id'), textOf(el)]).filter(([id]) => id));
+        const idOf = el => el.getAttribute('data-message-id') || el.getAttribute('data-chatgpt-search-message-ids') || el.getAttribute('data-content-search-unit-key');
+        const ids = new Map(initial.map(el => [idOf(el), textOf(el)]).filter(([id]) => id));
         const oldTexts = new Set(nodes.values());
         return () => {
             const all = getElements();
             const fresh = all.filter(el => {
-                const text = textOf(el), id = el.getAttribute('data-message-id');
+                const text = textOf(el), id = idOf(el);
                 if (id && ids.has(id)) return ids.get(id) !== text;
                 if (nodes.has(el)) return nodes.get(el) !== text;
                 return !!id || all.length > initial.length || !oldTexts.has(text);
@@ -124,10 +158,11 @@
 
     function isProviderProcessing(provider, text) {
         const doc = root.document;
-        const controls = doc.querySelectorAll('button[data-testid="stop-button"], button[aria-label], [data-is-streaming="true"]');
+        const controls = doc.querySelectorAll('button[data-testid="stop-button"], button[aria-label], [data-is-streaming="true"], [data-talvt-turn-state]');
         for (const element of controls) {
             if (!isVisible(element) || element.disabled || element.getAttribute('aria-disabled') === 'true') continue;
             if (element.getAttribute('data-is-streaming') === 'true' || element.getAttribute('data-testid') === 'stop-button') return true;
+            if (['streaming', 'running', 'in_progress'].includes(element.getAttribute('data-talvt-turn-state'))) return true;
             if (/^(stop|stop generating|stop generation|stop response|остановить|остановить генерацию)$/i.test((element.getAttribute('aria-label') || '').trim())) return true;
         }
         if ((text || '').length > 180) return false;
@@ -226,5 +261,6 @@
 
     root.CqsAI = Object.freeze({ DEFAULT_SETTINGS, TIMEOUT_OPTIONS, normalizeSettings, getSettings,
         saveSettings, runWithProviders, extractJsonObjects, hasCompleteAnswers, waitForResponse,
-        normalizeAnswers, hasCompleteResponseEnvelope, isVisible, createResponseTracker, isProviderProcessing, waitForStoredAnswer });
+        normalizeAnswers, hasCompleteResponseEnvelope, isVisible, createResponseTracker, isProviderProcessing, waitForStoredAnswer,
+        findChatGptEditor, findChatGptSendButton, getChatGptResponses, chatGptDomStatus });
 })(globalThis);

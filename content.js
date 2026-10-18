@@ -414,17 +414,18 @@
           const el = document.getElementById('cqs-status');
           if (el) el.textContent = `${AI_NAME}: ${stage}${progress.characters ? ` (${progress.characters} characters)` : ''}`;
         } });
-      globalThis.CqsDebug?.log('coursera', 'answer_received', { taskId, provider: aiChoice, characters: ansData.rawText?.length || 0, answers: ansData.answers?.length || 0 });
       const pendingTask = await chrome.storage.local.get([TASK_KEY]);
       if (pendingTask[TASK_KEY]?.taskId === taskId) await chrome.storage.local.remove([TASK_KEY]);
 
       // Error from bridge
       if (ansData.error) {
+        globalThis.CqsDebug?.log('coursera', 'provider_error', { taskId, provider: aiChoice, code: ansData.code || 'BRIDGE_ERROR', message: ansData.error }, 'error');
         setStatus(`⚠ ${AI_NAME}: ${ansData.error}`);
         blocks.forEach(b => showError(b, ansData.error));
         await chrome.storage.local.remove([ANSWER_KEY, 'cqsBridgeStatus']);
         return false;
       }
+      globalThis.CqsDebug?.log('coursera', 'answer_received', { taskId, provider: aiChoice, characters: ansData.rawText?.length || 0, answers: ansData.answers?.length || 0 });
 
       // Got a response (answers array OR rawText)
       const hasAnswers = Array.isArray(ansData.answers) && ansData.answers.length > 0;
@@ -797,6 +798,7 @@
     // Step C: Solve all questions (Using Web UI logic now)
     setStatus(`Quiz ${idx + 1} of ${total} — Answering...`);
     const success = await solveWithSelectedProvider();
+    if (stopRequested) return;
     if (!success) {
       await setState({ ...state, active: false, lastError: 'AI_RESPONSE_FAILED' });
       globalThis.CqsDebug?.log('coursera', 'queue_paused', { index: idx, code: 'AI_RESPONSE_FAILED' }, 'error');
@@ -809,6 +811,7 @@
     await delay(600);
 
     // Step E: Submit
+    if (stopRequested) return;
     setStatus(`Quiz ${idx + 1} of ${total} — Submitting...`);
     const pending = { ...state, phase: 'awaiting_submission', submissionStartedAt: Date.now() };
     await setState(pending);
@@ -1951,7 +1954,7 @@
 
         setStatus('Answering questions...');
         const success = await solveWithSelectedProvider();
-        if (!success) {
+        if (!success || stopRequested) {
           return;
         }
 
@@ -1959,6 +1962,7 @@
         await checkHonorCode();
         await delay(600);
 
+        if (stopRequested) return;
         setStatus('Submitting...');
         const submitted = await submitQuiz();
         setStatus(submitted ? 'Submit clicked. Check the Coursera result.' : '⚠ Submit button not found — check manually');
