@@ -77,6 +77,94 @@
         return true;
     }
 
+    function normalizeAnswers(answers) {
+        if (!Array.isArray(answers)) return [];
+        return answers.filter(item => item && Number.isInteger(Number(item.q))).map(item => {
+            const value = item.a ?? item.text;
+            const values = Array.isArray(value) ? value : [value];
+            return { ...item, q: Number(item.q), a: values.filter(v => typeof v === 'string' || typeof v === 'number').map(String) };
+        });
+    }
+
+    function hasCompleteResponseEnvelope(text) {
+        if (!/"answers"\s*:/.test(text)) return true;
+        return extractJsonObjects(text).some(candidate => /"answers"\s*:/.test(candidate));
+    }
+
+    function isVisible(element) {
+        if (!element || element.hidden || element.closest?.('[hidden], [aria-hidden="true"]')) return false;
+        const style = root.getComputedStyle?.(element);
+        if (style && (style.display === 'none' || style.visibility === 'hidden')) return false;
+        if (typeof element.getClientRects === 'function' && element.getClientRects().length === 0) {
+            return style?.display === 'contents' && [...element.children].some(isVisible);
+        }
+        return true;
+    }
+
+    // React can update a response in place, or remount old messages with new nodes.
+    // Track both identity and text so either case is handled without reading an old reply.
+    function createResponseTracker(getElements) {
+        const initial = getElements();
+        const textOf = el => (el.innerText || el.textContent || '').trim();
+        const nodes = new Map(initial.map(el => [el, textOf(el)]));
+        const ids = new Map(initial.map(el => [el.getAttribute('data-message-id'), textOf(el)]).filter(([id]) => id));
+        const oldTexts = new Set(nodes.values());
+        return () => {
+            const all = getElements();
+            const fresh = all.filter(el => {
+                const text = textOf(el), id = el.getAttribute('data-message-id');
+                if (id && ids.has(id)) return ids.get(id) !== text;
+                if (nodes.has(el)) return nodes.get(el) !== text;
+                return !!id || all.length > initial.length || !oldTexts.has(text);
+            });
+            const outer = fresh.filter(el => !fresh.some(other => other !== el && other.contains?.(el)));
+            return outer.map(textOf).filter(Boolean).join('\n\n');
+        };
+    }
+
+    function isProviderProcessing(provider, text) {
+        const doc = root.document;
+        const controls = doc.querySelectorAll('button[data-testid="stop-button"], button[aria-label], [data-is-streaming="true"]');
+        for (const element of controls) {
+            if (!isVisible(element) || element.disabled || element.getAttribute('aria-disabled') === 'true') continue;
+            if (element.getAttribute('data-is-streaming') === 'true' || element.getAttribute('data-testid') === 'stop-button') return true;
+            if (/^(stop|stop generating|stop generation|stop response|остановить|остановить генерацию)$/i.test((element.getAttribute('aria-label') || '').trim())) return true;
+        }
+        if ((text || '').length > 180) return false;
+        return provider === 'chatgpt'
+            ? /^(analyzing|thinking|searching(?: the)? web|running analysis)[.\s…]*$/i.test(text || '')
+            : /taking longer than usual|trying again shortly|attempt\s+\d+/i.test(text || '');
+    }
+
+    function waitForStoredAnswer({ answerKey, progressKey, taskId, timeoutMs, isCancelled = () => false, onProgress = () => {} }) {
+        return new Promise((resolve, reject) => {
+            let finished = false, interval, timeout;
+            const finish = (error, value) => {
+                if (finished) return;
+                finished = true;
+                clearInterval(interval);
+                clearTimeout(timeout);
+                chrome.storage.onChanged.removeListener(listener);
+                if (error) reject(error); else resolve(value);
+            };
+            const consume = data => {
+                if (isCancelled()) return finish(new Error('AI task cancelled.'));
+                const progress = data[progressKey];
+                if (progress?.taskId === taskId) onProgress(progress);
+                if (data[answerKey]?.taskId === taskId) finish(null, data[answerKey]);
+            };
+            const poll = () => chrome.storage.local.get([answerKey, progressKey]).then(consume).catch(error => finish(error));
+            const listener = (changes, area) => {
+                if (area !== 'local') return;
+                consume(Object.fromEntries(Object.entries(changes).map(([key, change]) => [key, change.newValue])));
+            };
+            chrome.storage.onChanged.addListener(listener);
+            interval = setInterval(poll, 2000);
+            timeout = setTimeout(() => finish(new Error('AI response timed out. Open Debug to see the last bridge stage.')), Math.max(0, timeoutMs));
+            poll();
+        });
+    }
+
     // Read the full response only after generation stops and the text settles.
     // A timeout rejects; it never returns a partially streamed answer.
     function waitForResponse(getText, {
@@ -85,11 +173,12 @@
         isComplete = () => true,
         isCancelled = () => false,
         stableMs = 3000,
+        onProgress = () => {},
         target = root.document?.body,
     } = {}) {
         return new Promise((resolve, reject) => {
             const deadline = Date.now() + Math.max(0, timeoutMs);
-            let lastText = '', changedAt = Date.now(), interval, timeout, observer;
+            let lastText = '', changedAt = Date.now(), interval, timeout, observer, lastProgress = -Infinity;
             let finished = false;
 
             function finish(error, text) {
@@ -109,6 +198,10 @@
                     if (Date.now() >= deadline) return finish(new Error('AI response timed out. Increase the response wait time and try again.'));
                     const text = getText() || '';
                     const processing = isProcessing(text);
+                    if (Date.now() - lastProgress >= 2000) {
+                        lastProgress = Date.now();
+                        onProgress({ stage: !text ? 'waiting_for_response' : processing ? 'generating' : 'response_detected', characters: text.length });
+                    }
                     if (text !== lastText || processing) {
                         lastText = text;
                         changedAt = Date.now();
@@ -132,5 +225,6 @@
     }
 
     root.CqsAI = Object.freeze({ DEFAULT_SETTINGS, TIMEOUT_OPTIONS, normalizeSettings, getSettings,
-        saveSettings, runWithProviders, extractJsonObjects, hasCompleteAnswers, waitForResponse });
+        saveSettings, runWithProviders, extractJsonObjects, hasCompleteAnswers, waitForResponse,
+        normalizeAnswers, hasCompleteResponseEnvelope, isVisible, createResponseTracker, isProviderProcessing, waitForStoredAnswer });
 })(globalThis);

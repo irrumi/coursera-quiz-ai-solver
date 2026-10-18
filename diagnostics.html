@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Quiz AI — Debug</title>
+  <link rel="stylesheet" href="diagnostics.css">
+</head>
+<body>
+  <main>
+    <h1>Quiz AI Debug</h1>
+    <p>Local diagnostics. The exported report excludes question text, answers, screenshots, course names, and page URLs.</p>
+    <div class="actions">
+      <button id="refresh">Refresh</button>
+      <button id="copy">Copy report</button>
+      <button id="download">Download report</button>
+      <button id="clear">Clear log</button>
+    </div>
+    <p id="status" role="status">Loading diagnostics...</p>
+    <h2>Last quiz scan</h2>
+    <p id="scan-summary">No scan yet. Use Scan quizzes in the extension popup.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Quiz</th><th>Status</th><th>Queue</th><th>Reason</th></tr></thead>
+      <tbody id="scan-items"></tbody>
+    </table></div>
+    <h2>Technical report</h2>
+    <pre id="report"></pre>
+  </main>
+  <script src="diagnostics.js"></script>
+  <script src="diagnostics_ui.js"></script>
+</body>
+</html>

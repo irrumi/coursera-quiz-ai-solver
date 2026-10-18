@@ -7,23 +7,31 @@
 
 (async function () {
     'use strict';
+    const bridgeVersion = chrome.runtime.getManifest().version;
+    if (globalThis.__cqsClaudeBridgeVersion === bridgeVersion) return;
+    globalThis.__cqsClaudeBridgeVersion = bridgeVersion;
 
     const TASK_KEY = 'cqsClaudeTask';
     const ANSWER_KEY = 'cqsClaudeAnswers';
+    const PROGRESS_KEY = 'cqsClaudeProgress';
     let activeTaskId = null;
-
-    // Module-level constant — must be here (not inside handleTask) to avoid TDZ errors
-    // when isClaudeRetryMessage() is called before the const line executes.
-    const CLAUDE_RETRY_PHRASES = [
-        /taking longer than usual/i,
-        /trying again shortly/i,
-        /[\u2026].*attempt\s+\d+/i,   // "… attempt 2"
-    ];
+    globalThis.CqsDebug?.attach('claude');
+    chrome.runtime.onMessage.addListener((message, _, reply) => {
+        if (message.type === 'CQS_BRIDGE_PING') reply({ ok: true, provider: 'claude', version: bridgeVersion });
+    });
+    function launchTask(task) {
+        handleTask(task).catch(async error => {
+            if (activeTaskId !== task.taskId) return;
+            globalThis.CqsDebug?.log('claude', 'task_failed', { taskId: task.taskId, message: error.message }, 'error');
+            await chrome.storage.local.set({ [ANSWER_KEY]: { error: error.message, code: 'BRIDGE_ERROR', taskId: task.taskId } });
+            await chrome.storage.local.remove([TASK_KEY]);
+        });
+    }
 
     // ── Listen for new tasks when the tab is reused ───────────────────────────
     chrome.storage.onChanged.addListener((changes, namespace) => {
         if (namespace === 'local' && changes[TASK_KEY]) {
-            if (changes[TASK_KEY].newValue) handleTask(changes[TASK_KEY].newValue);
+            if (changes[TASK_KEY].newValue) launchTask(changes[TASK_KEY].newValue);
             else activeTaskId = null;
         }
     });
@@ -31,13 +39,17 @@
     // ── Check for a pending task on initial load ──────────────────────────────
     const storage = await chrome.storage.local.get([TASK_KEY]);
     if (storage[TASK_KEY] && !activeTaskId) {
-        handleTask(storage[TASK_KEY]);
+        launchTask(storage[TASK_KEY]);
     }
 
     async function handleTask(task) {
         if (!task?.prompt || activeTaskId === task.taskId) return;
+        const claim = await chrome.runtime.sendMessage({ type: 'CQS_CLAIM_TASK', provider: 'claude', taskId: task.taskId });
+        if (!claim?.ok || activeTaskId === task.taskId) return;
         activeTaskId = task.taskId;
+        let lastProgressStage = '';
         const deadline = task.deadline || Date.now() + CqsAI.DEFAULT_SETTINGS.responseTimeoutSeconds * 1000;
+        await updateProgress('finding_editor');
 
         console.log('[QuizAI Bridge] ✅ Task found. Prompt length:', task.prompt.length);
 
@@ -70,18 +82,14 @@
         function getAllResponseEls() {
             for (const sel of RESPONSE_SELS) {
                 const all = document.querySelectorAll(sel);
-                if (all.length > 0) return [...all];
+                const visible = [...all].filter(CqsAI.isVisible);
+                if (visible.length > 0) return visible;
             }
             return [];
         }
 
-        function normalizeText(t) { return (t || '').replace(/\s+/g, ' ').trim(); }
-
-        const baselineEls = getAllResponseEls();
-        const baselineCount = baselineEls.length;
-        const baselineNodes = new Set(baselineEls);
-        const baselineLastText = baselineEls.length ? normalizeText(baselineEls[baselineEls.length - 1].innerText) : '';
-        console.log('[QuizAI Bridge] Baseline captured. Count:', baselineCount, 'Last text len:', baselineLastText.length);
+        const readResponse = CqsAI.createResponseTracker(getAllResponseEls);
+        await updateProgress('inserting_prompt');
 
         // ── 4. Paste question screenshots (for vision/image questions) ────────────
         if (Array.isArray(task.screenshots) && task.screenshots.length > 0) {
@@ -131,6 +139,8 @@
         ], 5000);
 
         if (activeTaskId !== task.taskId) return;
+        if (Date.now() >= deadline) { await storeError('Task expired before sending. Try again.'); return; }
+        await updateProgress('sending_prompt');
 
         if (sendBtn && !sendBtn.disabled) {
             console.log('[QuizAI Bridge] Clicking Send...');
@@ -147,25 +157,19 @@
 
         let responseText;
         try {
-            responseText = await CqsAI.waitForResponse(() => {
-                const fresh = getAllResponseEls().filter(el => !baselineNodes.has(el));
-                return fresh.map(el => el.innerText || '').join('\n\n').trim();
-            }, {
+            responseText = await CqsAI.waitForResponse(readResponse, {
                 timeoutMs: deadline - Date.now(),
-                isProcessing: text => isClaudeRetryMessage(text) || !!document.querySelector(
-                    'button[aria-label*="Stop" i], button[data-testid="stop-button"], [data-is-streaming="true"], .font-claude-response[aria-busy="true"]'
-                ),
-                isComplete: text => CqsAI.hasCompleteAnswers(
-                    parseClaudeResponse(text, text.includes('"answers"')), task.expectedAnswers
-                ),
+                isProcessing: text => CqsAI.isProviderProcessing('claude', text),
+                isComplete: CqsAI.hasCompleteResponseEnvelope,
                 isCancelled: () => activeTaskId !== task.taskId,
+                onProgress: progress => { updateProgress(progress.stage, { characters: progress.characters }).catch(() => {}); },
             });
         } catch (error) {
             if (activeTaskId === task.taskId) await storeError(error.message);
             return;
         }
 
-        console.log('[QuizAI Bridge] Stable response (', responseText.length, ' chars):', responseText.slice(0, 150));
+        console.log('[QuizAI Bridge] Stable response (', responseText.length, ' chars)');
 
         if (!responseText.trim()) {
             await storeError('Claude response was empty. Try again.');
@@ -173,9 +177,10 @@
         }
 
         // ── 8. Parse and store ───────────────────────────────────────────────────────
-        const answers = parseClaudeResponse(responseText);
+        const answers = CqsAI.normalizeAnswers(parseClaudeResponse(responseText));
         if (activeTaskId !== task.taskId) return;
-        console.log('[QuizAI Bridge] Parsed', answers.length, 'answers:', JSON.stringify(answers));
+        await updateProgress('response_captured', { characters: responseText.length, answers: answers.length, expected: task.expectedAnswers || 0 });
+        console.log('[QuizAI Bridge] Parsed', answers.length, 'answers');
 
         await chrome.storage.local.set({
             [ANSWER_KEY]: {
@@ -231,13 +236,6 @@
                     console.warn(`[QuizAI Bridge] Failed to paste image for Q${q}:`, e);
                 }
             }
-        }
-
-        // CLAUDE_RETRY_PHRASES is defined at module scope (top of file) to avoid TDZ errors.
-
-        function isClaudeRetryMessage(text) {
-            if (!text) return false;
-            return CLAUDE_RETRY_PHRASES.some(re => re.test(text));
         }
 
         function parseClaudeResponse(text, skipRegexFallback = false) {
@@ -322,10 +320,20 @@
 
         async function storeError(msg) {
             if (activeTaskId !== task.taskId) return;
+            await updateProgress('error', { message: msg });
             console.error('[QuizAI Bridge] ERROR:', msg);
             await chrome.storage.local.set({ [ANSWER_KEY]: { error: msg, taskId: task.taskId, timestamp: Date.now() } });
             await chrome.storage.local.remove([TASK_KEY]);
             showBanner('⚠ Quiz AI: ' + msg);
+        }
+
+        async function updateProgress(stage, details = {}) {
+            if (activeTaskId !== task.taskId) return;
+            await chrome.storage.local.set({ [PROGRESS_KEY]: { taskId: task.taskId, stage, timestamp: Date.now(), ...details } });
+            if (stage !== lastProgressStage) {
+                lastProgressStage = stage;
+                globalThis.CqsDebug?.log('claude', stage, { taskId: task.taskId, ...details }, stage === 'error' ? 'error' : 'info');
+            }
         }
 
         function showBanner(msg) {

@@ -8,8 +8,8 @@
 
 <br>
 
-<a href="https://github.com/aburahatsabir/coursera-quiz-ai-solver/releases/latest">
-  <img alt="Download coursera-quiz-ai-solver.zip" src="https://img.shields.io/badge/Download-coursera--quiz--ai--solver.zip-0056D2?style=for-the-badge">
+<a href="https://github.com/irrumi/coursera-quiz-ai-solver/archive/refs/heads/main.zip">
+  <img alt="Download fork source ZIP" src="https://img.shields.io/badge/Download-Fork_ZIP-0056D2?style=for-the-badge">
 </a>
 <a href="#install-in-2-minutes">
   <img alt="Install guide" src="https://img.shields.io/badge/Install-2_Minutes-111827?style=for-the-badge">
@@ -39,7 +39,7 @@
 </tr>
 <tr>
 <td>Download the extension</td>
-<td><a href="https://github.com/aburahatsabir/coursera-quiz-ai-solver/releases/latest">Latest Release</a></td>
+<td><a href="https://github.com/irrumi/coursera-quiz-ai-solver/archive/refs/heads/main.zip">Download Fork ZIP</a></td>
 </tr>
 <tr>
 <td>Install it in Chrome</td>
@@ -80,7 +80,7 @@ Coursera Quiz AI Solver is a browser extension that helps learners review Course
 | Coursera quiz support | Handles common quiz, exam, and assignment-submission pages |
 | Visual question support | Tries to include charts, images, canvases, and dataframe screenshots |
 | Peer-assignment feature | Peer support is included as a feature, not a separate product |
-| Open-source package | Latest release file is always `coursera-quiz-ai-solver.zip` |
+| Open-source package | Download this fork as a source ZIP and load it unpacked |
 
 > [!IMPORTANT]
 > Use this only where AI assistance and browser automation are allowed. Review every suggestion yourself and follow your course or institution rules.
@@ -91,7 +91,7 @@ Coursera Quiz AI Solver is a browser extension that helps learners review Course
 
 <table>
 <tr>
-<td width="25%"><strong>1. Download</strong><br><br>Get the latest release zip.</td>
+<td width="25%"><strong>1. Download</strong><br><br>Get the current fork ZIP.</td>
 <td width="25%"><strong>2. Extract</strong><br><br>Unzip it into a normal folder.</td>
 <td width="25%"><strong>3. Load</strong><br><br>Open Chrome extensions and load unpacked.</td>
 <td width="25%"><strong>4. Study</strong><br><br>Open Coursera plus ChatGPT or Claude.</td>
@@ -101,13 +101,13 @@ Coursera Quiz AI Solver is a browser extension that helps learners review Course
 ### Download the Correct File
 
 ```text
-coursera-quiz-ai-solver.zip
+coursera-quiz-ai-solver-main.zip
 ```
 
-Release page:
+Download this fork:
 
 ```text
-https://github.com/aburahatsabir/coursera-quiz-ai-solver/releases/latest
+https://github.com/irrumi/coursera-quiz-ai-solver/archive/refs/heads/main.zip
 ```
 
 ### Load It in Chrome
@@ -140,6 +140,35 @@ The response wait defaults to **10 minutes**. Choose 5, 10, 20, or 30 minutes in
 Long responses are stored in full. The bridge waits until generation stops and the response settles; a timeout does not apply a partially generated answer. Text-answer cards display the full text in a scrollable area and include a **Copy answer** button.
 
 After updating an unpacked copy, click **Reload** on `chrome://extensions/` and refresh the Coursera and AI tabs.
+
+### Scan and Solve Quizzes
+
+Use **Scan quizzes** in the popup to open the course assignments page and review the scan in **Debug**. **Auto-Solve Quizzes** runs the quiz queue; peer reviews remain a separate toolbar action.
+
+| Detected status | Queue behavior |
+| --- | --- |
+| Completed / Passed | Skip |
+| Not started / In progress / Not completed | Queue |
+| Failed / Didn't pass | Queue for another attempt |
+| Submitted / Awaiting grade | Skip while grading is pending |
+| Locked / Unavailable | Skip |
+| Status not visible | Queue for a page check; skip if the quiz page confirms it is already passed |
+
+The scanner reads visible assignment rows and accessible status labels. Hidden completion text, quiz titles, and neighboring video completion indicators do not establish that a quiz is done. An empty scan reports that no quiz links were found. It does not claim the course is complete. Expand the assignment list if the course hides items.
+
+The queue records the submission phase before clicking Submit and waits for a Coursera result. It pauses on the current quiz when confirmation is missing. It does not automatically click Submit again or advance after an unconfirmed submission.
+
+### Debug a Stalled Run
+
+Click **Debug** in the popup or the Coursera toolbar. The page shows the latest quiz scan, queue position, provider connections, and recent stages such as `finding_editor`, `sending_prompt`, `generating`, `response_detected`, and `response_captured`.
+
+- **Refresh** updates the report.
+- **Copy report** or **Download report** exports technical diagnostics for troubleshooting.
+- **Clear log** clears diagnostic events without removing the queue or AI tasks.
+
+Up to 250 events are stored locally. The exported report excludes prompts, answer text, screenshots, course names, and page URLs. There is no automatic diagnostic upload.
+
+If the AI has replied, capture and answer validation run separately: an incomplete answer set reports the missing question numbers instead of waiting until the full response timeout. Hidden or disabled Stop buttons do not block capture. Tabs opened before an extension update are reconnected when a run starts.
 
 ---
 
@@ -373,7 +402,7 @@ Coursera changes layouts often. Refresh the page and try again. If it keeps happ
 | Why keep both ChatGPT and Claude open? | Auto mode can fall back from ChatGPT to Claude. The default ChatGPT mode does not switch providers. |
 | Does it support peer assignments? | Yes, as a feature inside Coursera Quiz AI Solver. |
 | Is it official? | No. It is independent and not affiliated with Coursera, OpenAI, Anthropic, Google, or Chrome. |
-| What is the correct zip name? | `coursera-quiz-ai-solver.zip` |
+| Which ZIP should I download? | The source ZIP from this fork; select the extracted folder containing `manifest.json`. |
 
 ---
 
@@ -408,6 +437,11 @@ Most users can stop reading here. The sections below are for maintainers and con
 |-- manifest.json          # Chrome extension manifest, permissions, content scripts
 |-- background.js          # Service worker: opens ChatGPT/Claude tabs and capture bridge
 |-- ai_common.js           # Provider settings, full-response waiting, JSON extraction
+|-- quiz_scan.js           # Quiz row/status detection and queue candidates
+|-- diagnostics.js         # Bounded, filtered local diagnostics
+|-- diagnostics.html       # Scan results and debug report UI
+|-- diagnostics.css        # Debug report styling
+|-- diagnostics_ui.js      # Diagnostic refresh/copy/download actions
 |-- content.js             # Coursera toolbar, parser, queue state, quiz and peer workflows
 |-- chatgpt_bridge.js      # ChatGPT prompt injection and response parsing
 |-- claude_bridge.js       # Claude prompt injection and response parsing
@@ -520,6 +554,9 @@ Run syntax checks:
 ```bash
 node --check background.js
 node --check ai_common.js
+node --check quiz_scan.js
+node --check diagnostics.js
+node --check diagnostics_ui.js
 node --check content.js
 node --check chatgpt_bridge.js
 node --check claude_bridge.js
@@ -545,12 +582,12 @@ Optional browser checks require Playwright and Chromium (or set `CQS_BROWSER_CHA
 node tests/browser-smoke.cjs
 ```
 
-These checks use local fixtures and mocked extension storage. They verify UI choices, persistence, and full text insertion/display/clipboard handling, rather than live provider compatibility.
+These checks use local fixtures and mocked Chrome APIs. They cover provider choice, stale-tab reconnection, scan statuses, nested question detection, debug exports, long-answer handling, and the queue flow through a stubbed AI response to a confirmed submission. They do not establish live provider or Coursera compatibility.
 
 Package the extension:
 
 ```bash
-git archive --format=zip --output coursera-quiz-ai-solver.zip HEAD manifest.json background.js ai_common.js content.js chatgpt_bridge.js claude_bridge.js popup.html popup.css popup.js options.html options.js icons
+git archive --format=zip --output coursera-quiz-ai-solver.zip HEAD manifest.json background.js ai_common.js quiz_scan.js diagnostics.js diagnostics.html diagnostics.css diagnostics_ui.js content.js chatgpt_bridge.js claude_bridge.js popup.html popup.css popup.js options.html options.js icons
 ```
 
 </details>
@@ -580,14 +617,15 @@ Coursera Quiz AI Solver is an independent open-source browser extension. It is n
 
 <h3>Download the latest version</h3>
 
-<a href="https://github.com/aburahatsabir/coursera-quiz-ai-solver/releases/latest">
-  <img alt="Download coursera-quiz-ai-solver.zip" src="https://img.shields.io/badge/Download-coursera--quiz--ai--solver.zip-0056D2?style=for-the-badge">
+<a href="https://github.com/irrumi/coursera-quiz-ai-solver/archive/refs/heads/main.zip">
+  <img alt="Download fork source ZIP" src="https://img.shields.io/badge/Download-Fork_ZIP-0056D2?style=for-the-badge">
 </a>
 
 </div>
 
 ```text
-Repository: https://github.com/aburahatsabir/coursera-quiz-ai-solver
-Latest release: https://github.com/aburahatsabir/coursera-quiz-ai-solver/releases/latest
-Release asset: coursera-quiz-ai-solver.zip
+Fork: https://github.com/irrumi/coursera-quiz-ai-solver
+Upstream: https://github.com/aburahatsabir/coursera-quiz-ai-solver
+Source ZIP: https://github.com/irrumi/coursera-quiz-ai-solver/archive/refs/heads/main.zip
+Version: 6.1.3 (unpacked extension)
 ```

@@ -2,22 +2,31 @@
 
 (async function () {
     'use strict';
+    const bridgeVersion = chrome.runtime.getManifest().version;
+    if (globalThis.__cqsChatGptBridgeVersion === bridgeVersion) return;
+    globalThis.__cqsChatGptBridgeVersion = bridgeVersion;
 
     const TASK_KEY = 'cqsChatGptTask';
     const ANSWER_KEY = 'cqsChatGptAnswers';
+    const PROGRESS_KEY = 'cqsChatGptProgress';
     let activeTaskId = null;
-
-    // CHATGPT_PROCESSING_PHRASES detects temporary blocks. Defined globally to avoid TDZ errors.
-    const CHATGPT_PROCESSING_PHRASES = [
-        /analyzing(?:\s|\.)*$/i,
-        /searching(?:\s.*)?web(?:\s|\.)*$/i,
-        /running analysis(?:\s|\.)*$/i
-    ];
+    globalThis.CqsDebug?.attach('chatgpt');
+    chrome.runtime.onMessage.addListener((message, _, reply) => {
+        if (message.type === 'CQS_BRIDGE_PING') reply({ ok: true, provider: 'chatgpt', version: bridgeVersion });
+    });
+    function launchTask(task) {
+        handleTask(task).catch(async error => {
+            if (activeTaskId !== task.taskId) return;
+            globalThis.CqsDebug?.log('chatgpt', 'task_failed', { taskId: task.taskId, message: error.message }, 'error');
+            await chrome.storage.local.set({ [ANSWER_KEY]: { error: error.message, code: 'BRIDGE_ERROR', taskId: task.taskId } });
+            await chrome.storage.local.remove([TASK_KEY]);
+        });
+    }
 
     // ── Listen for new tasks when the tab is reused ───────────────────────────
     chrome.storage.onChanged.addListener((changes, namespace) => {
         if (namespace === 'local' && changes[TASK_KEY]) {
-            if (changes[TASK_KEY].newValue) handleTask(changes[TASK_KEY].newValue);
+            if (changes[TASK_KEY].newValue) launchTask(changes[TASK_KEY].newValue);
             else activeTaskId = null;
         }
     });
@@ -25,13 +34,17 @@
     // ── Check for a pending task on initial load ──────────────────────────────
     const storage = await chrome.storage.local.get([TASK_KEY]);
     if (storage[TASK_KEY] && !activeTaskId) {
-        handleTask(storage[TASK_KEY]);
+        launchTask(storage[TASK_KEY]);
     }
 
     async function handleTask(task) {
         if (!task?.prompt || activeTaskId === task.taskId) return;
+        const claim = await chrome.runtime.sendMessage({ type: 'CQS_CLAIM_TASK', provider: 'chatgpt', taskId: task.taskId });
+        if (!claim?.ok || activeTaskId === task.taskId) return;
         activeTaskId = task.taskId;
+        let lastProgressStage = '';
         const deadline = task.deadline || Date.now() + CqsAI.DEFAULT_SETTINGS.responseTimeoutSeconds * 1000;
+        await updateProgress('finding_editor');
 
         console.log('[QuizAI Bridge] ✅ Task found. Prompt length:', task.prompt.length);
 
@@ -53,24 +66,21 @@
 
         // ── 3. Snapshot baseline BEFORE sending ──────────────────────────────────────
         const RESPONSE_SELS = [
-            'div[data-message-author-role="assistant"]'
+            '[data-message-author-role="assistant"]',
+            '[data-turn="assistant"]'
         ];
 
         function getAllResponseEls() {
             for (const sel of RESPONSE_SELS) {
                 const all = document.querySelectorAll(sel);
-                if (all.length > 0) return [...all];
+                const visible = [...all].filter(CqsAI.isVisible);
+                if (visible.length > 0) return visible;
             }
             return [];
         }
 
-        function normalizeText(t) { return (t || '').replace(/\s+/g, ' ').trim(); }
-
-        const baselineEls = getAllResponseEls();
-        const baselineCount = baselineEls.length;
-        const baselineIds = new Set(baselineEls.map(el => el.getAttribute('data-message-id')).filter(Boolean));
-        const baselineNodes = new Set(baselineEls);
-        console.log('[QuizAI Bridge] Baseline captured. Count:', baselineCount, 'IDs tracked:', baselineIds.size);
+        const readResponse = CqsAI.createResponseTracker(getAllResponseEls);
+        await updateProgress('inserting_prompt');
 
         // ── 4. Paste question screenshots (for vision/image questions) ────────────
         if (Array.isArray(task.screenshots) && task.screenshots.length > 0) {
@@ -118,6 +128,8 @@
         ], 5000);
 
         if (activeTaskId !== task.taskId) return;
+        if (Date.now() >= deadline) { await storeError('Task expired before sending. Try again.'); return; }
+        await updateProgress('sending_prompt');
 
         if (sendBtn && !sendBtn.disabled) {
             console.log('[QuizAI Bridge] Clicking Send...');
@@ -134,19 +146,12 @@
 
         let responseText;
         try {
-            responseText = await CqsAI.waitForResponse(() => {
-                const fresh = getAllResponseEls().filter(el => {
-                    const id = el.getAttribute('data-message-id');
-                    return id ? !baselineIds.has(id) : !baselineNodes.has(el);
-                });
-                return fresh.map(el => el.innerText || '').join('\n\n').trim();
-            }, {
+            responseText = await CqsAI.waitForResponse(readResponse, {
                 timeoutMs: deadline - Date.now(),
                 isProcessing: isChatGPTProcessing,
-                isComplete: text => CqsAI.hasCompleteAnswers(
-                    parseChatGPTResponse(text, text.includes('"answers"')).answers, task.expectedAnswers
-                ),
+                isComplete: CqsAI.hasCompleteResponseEnvelope,
                 isCancelled: () => activeTaskId !== task.taskId,
+                onProgress: progress => { updateProgress(progress.stage, { characters: progress.characters }).catch(() => {}); },
             });
         } catch (error) {
             if (activeTaskId === task.taskId) await storeError(error.message);
@@ -162,9 +167,12 @@
 
         // ── 8. Parse and store ───────────────────────────────────────────────────────
         // parseChatGPTResponse returns { answers, uploadFileSvg }
-        const { answers, uploadFileSvg } = parseChatGPTResponse(responseText);
+        const parsed = parseChatGPTResponse(responseText);
+        const answers = CqsAI.normalizeAnswers(parsed.answers);
+        const uploadFileSvg = parsed.uploadFileSvg;
         if (activeTaskId !== task.taskId) return;
-        console.log('[QuizAI Bridge] Parsed', answers.length, 'answers:', JSON.stringify(answers));
+        await updateProgress('response_captured', { characters: responseText.length, answers: answers.length, expected: task.expectedAnswers || 0 });
+        console.log('[QuizAI Bridge] Parsed', answers.length, 'answers');
         if (uploadFileSvg) console.log('[QuizAI Bridge] Got uploadFileSvg (' + uploadFileSvg.length + ' chars)');
 
         await chrome.storage.local.set({
@@ -230,10 +238,7 @@
         }
 
         function isChatGPTProcessing(text) {
-            if (text === '[TOOL_PROCESSING]') return true;
-            if (document.querySelector('button[aria-label*="Stop" i], button[data-testid="stop-button"], [data-is-streaming="true"], [data-message-author-role="assistant"][aria-busy="true"]')) return true;
-            if (!text) return false;
-            return CHATGPT_PROCESSING_PHRASES.some(re => re.test(text));
+            return CqsAI.isProviderProcessing('chatgpt', text);
         }
 
         // Returns { answers: [...], uploadFileSvg: "<svg>...</svg>" | null }
@@ -322,10 +327,20 @@
 
         async function storeError(msg) {
             if (activeTaskId !== task.taskId) return;
+            await updateProgress('error', { message: msg });
             console.error('[QuizAI Bridge] ERROR:', msg);
             await chrome.storage.local.set({ [ANSWER_KEY]: { error: msg, taskId: task.taskId, timestamp: Date.now() } });
             await chrome.storage.local.remove([TASK_KEY]);
             showBanner('⚠ Quiz AI: ' + msg);
+        }
+
+        async function updateProgress(stage, details = {}) {
+            if (activeTaskId !== task.taskId) return;
+            await chrome.storage.local.set({ [PROGRESS_KEY]: { taskId: task.taskId, stage, timestamp: Date.now(), ...details } });
+            if (stage !== lastProgressStage) {
+                lastProgressStage = stage;
+                globalThis.CqsDebug?.log('chatgpt', stage, { taskId: task.taskId, ...details }, stage === 'error' ? 'error' : 'info');
+            }
         }
 
         function showBanner(msg) {

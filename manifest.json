@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Coursera Quiz AI Solver",
-  "version": "6.1.2",
+  "version": "6.1.3",
   "description": "Automated quiz solver for Coursera with peer assignment support. Supports ChatGPT and Claude AI endpoints across tabs.",
   "icons": {
     "16": "icons/icon16.png",
@@ -28,6 +28,8 @@
       ],
       "js": [
         "ai_common.js",
+        "diagnostics.js",
+        "quiz_scan.js",
         "content.js"
       ],
       "run_at": "document_idle"
@@ -38,6 +40,7 @@
       ],
       "js": [
         "ai_common.js",
+        "diagnostics.js",
         "claude_bridge.js"
       ],
       "run_at": "document_idle"
@@ -48,6 +51,7 @@
       ],
       "js": [
         "ai_common.js",
+        "diagnostics.js",
         "chatgpt_bridge.js"
       ],
       "run_at": "document_idle"

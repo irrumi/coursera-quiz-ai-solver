@@ -1,10 +1,15 @@
-// popup.js — v6.1.2 Web UI
+// popup.js — v6.1.3 Web UI
+globalThis.CqsDebug?.attach('popup');
 
 const solveAllBtn = document.getElementById('solve-all-btn');
 const autoSolveBtn = document.getElementById('auto-solve-btn');
 const providerButtons = [...document.querySelectorAll('[data-provider]')];
 const responseTimeout = document.getElementById('response-timeout');
 let selectedSettings = CqsAI.normalizeSettings();
+function showPopupError(error) {
+    document.getElementById('status-text').textContent = error.message || String(error);
+    globalThis.CqsDebug?.log('popup', 'action_failed', { message: error.message || String(error) }, 'error');
+}
 
 function renderSettings() {
     providerButtons.forEach(button => {
@@ -23,12 +28,14 @@ let settingsReady = CqsAI.getSettings().then(settings => {
     providerButtons.forEach(button => { button.disabled = false; });
     responseTimeout.disabled = false;
     solveAllBtn.disabled = autoSolveBtn.disabled = false;
-});
+}).catch(error => { showPopupError(error); throw error; });
+settingsReady.catch(() => {});
 
 function persistSettings() {
     const settings = { ...selectedSettings };
     renderSettings();
-    settingsReady = settingsReady.then(() => CqsAI.saveSettings(settings));
+    settingsReady = settingsReady.catch(() => {}).then(() => CqsAI.saveSettings(settings));
+    settingsReady.catch(showPopupError);
 }
 
 providerButtons.forEach(button => button.addEventListener('click', () => {
@@ -45,39 +52,28 @@ chrome.storage.onChanged.addListener((changes, namespace) => {
     renderSettings();
 });
 
-// ── Answer this quiz only (Single Quiz Solve) ─────────────────────────────────
-solveAllBtn.addEventListener('click', async () => {
-    await settingsReady;
-    const orig = solveAllBtn.innerHTML;
-    solveAllBtn.disabled = true;
-    solveAllBtn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg> Starting solver...`;
-    chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
-        if (!tabs[0]) { restore(); return; }
-        chrome.tabs.sendMessage(tabs[0].id, { type: 'TRIGGER_SOLVE_ALL' }, () => {
-            if (chrome.runtime.lastError) {
-                // If content script isn't running
-                console.error(chrome.runtime.lastError);
-            }
-            setTimeout(restore, 3000);
-        });
-    });
-    function restore() { solveAllBtn.disabled = false; solveAllBtn.innerHTML = orig; }
-});
+async function trigger(button, message) {
+    button.disabled = true;
+    try {
+        await settingsReady;
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (!tab || !/^https:\/\/([\w-]+\.)?coursera\.org\//.test(tab.url || '')) throw new Error('Open a Coursera course tab first.');
+        let ping;
+        try { ping = await chrome.tabs.sendMessage(tab.id, { type: 'CQS_CONTENT_PING' }); } catch { /* Reconnect tabs opened before extension installation/reload. */ }
+        if (!ping?.ok || ping.version !== chrome.runtime.getManifest().version) {
+            await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['ai_common.js', 'diagnostics.js', 'quiz_scan.js', 'content.js'] });
+        }
+        const response = await chrome.tabs.sendMessage(tab.id, message);
+        if (!response?.ok) throw new Error(response?.error || 'Coursera content script did not respond. Refresh the page.');
+        document.getElementById('status-text').textContent = message.phase === 'scan_quizzes' ? 'Scanning quizzes...' : 'Started on Coursera';
+    } catch (error) { showPopupError(error); }
+    finally { button.disabled = false; }
+}
 
-// ── Auto-solve all assignments (Pipeline) ──────────────────────────────────────
-autoSolveBtn.addEventListener('click', async () => {
-    await settingsReady;
-    const orig = autoSolveBtn.innerHTML;
-    autoSolveBtn.disabled = true;
-    autoSolveBtn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg> Starting pipeline...`;
-    chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
-        if (!tabs[0]) { restore(); return; }
-        chrome.tabs.sendMessage(tabs[0].id, { type: 'TRIGGER_START' }, () => {
-            if (chrome.runtime.lastError) {
-                console.error(chrome.runtime.lastError);
-            }
-            setTimeout(restore, 3000);
-        });
-    });
-    function restore() { autoSolveBtn.disabled = false; autoSolveBtn.innerHTML = orig; }
+solveAllBtn.addEventListener('click', () => trigger(solveAllBtn, { type: 'TRIGGER_SOLVE_ALL' }));
+autoSolveBtn.addEventListener('click', () => trigger(autoSolveBtn, { type: 'TRIGGER_START', phase: 'collect_quizzes' }));
+const scanButton = document.getElementById('scan-quizzes-btn');
+scanButton.addEventListener('click', () => trigger(scanButton, { type: 'TRIGGER_START', phase: 'scan_quizzes' }));
+document.getElementById('debug-btn').addEventListener('click', () => {
+    chrome.runtime.sendMessage({ type: 'OPEN_DEBUG' }).catch(showPopupError);
 });

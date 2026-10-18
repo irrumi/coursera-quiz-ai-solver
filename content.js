@@ -4,6 +4,10 @@
 
 (function () {
   'use strict';
+  const contentVersion = chrome.runtime.getManifest().version;
+  if (globalThis.__cqsContentVersion === contentVersion) return;
+  globalThis.__cqsContentVersion = contentVersion;
+  globalThis.CqsDebug?.attach('coursera');
 
   // ─── State key stored in chrome.storage.local ──────────────────────────────
   // {
@@ -54,7 +58,7 @@
       return;
     }
 
-    if (isAssignmentsPage && state?.active && state?.phase === 'collect_quizzes') {
+    if (isAssignmentsPage && state?.active && ['collect_quizzes', 'scan_quizzes'].includes(state?.phase)) {
       buildToolbar('Looking for pending quizzes...', false);
       await delay(1500);
       await collectQuizzes(state);
@@ -66,9 +70,10 @@
     // 'peer_review_queue'  → autoSolvePeerReview (peer review pages in master queue)
     // 'peer_review'        → autoSolvePeerReview (standalone manual trigger)
 
-    if (isQuizPage && state?.active && state?.phase === 'quiz') {
+    if (isQuizPage && state?.active && ['quiz', 'awaiting_submission'].includes(state?.phase)) {
       buildToolbar(`Solving quiz ${state.currentIndex + 1} of ${state.quizUrls.length} — please wait...`, false);
       await delay(2000);
+      if (state.phase === 'awaiting_submission') { await reconcileSubmission(state); return; }
       await autoSolveAndSubmit(state);
       return;
     }
@@ -169,6 +174,20 @@
     }
 
     document.body.appendChild(t);
+    if (!document.getElementById('cqs-status')) {
+      const wrap = document.createElement('div');
+      wrap.id = 'cqs-status-wrap';
+      const status = document.createElement('span');
+      status.id = 'cqs-status';
+      status.textContent = statusMsg;
+      wrap.appendChild(status);
+      t.appendChild(wrap);
+    }
+    const debugButton = document.createElement('button');
+    debugButton.id = 'cqs-debug-btn';
+    debugButton.textContent = 'Debug';
+    debugButton.addEventListener('click', () => chrome.runtime.sendMessage({ type: 'OPEN_DEBUG' }));
+    t.appendChild(debugButton);
 
     const providerSelect = document.getElementById('cqs-provider');
     const timeoutSelect = document.getElementById('cqs-response-timeout');
@@ -198,6 +217,7 @@
   }
 
   function setStatus(txt) {
+    globalThis.CqsDebug?.log('coursera', 'status', { message: txt });
     const el = document.getElementById('cqs-status');
     if (el) {
       el.textContent = txt;
@@ -210,7 +230,7 @@
   // ════════════════════════════════════════════════════════════════════════════
   //  PIPELINE ENTRY POINT
   // ════════════════════════════════════════════════════════════════════════════
-  async function startPipeline(targetPhase = 'quiz') {
+  async function startPipeline(targetPhase = 'collect_quizzes') {
     await settingsSave;
     stopRequested = false;
     if (!courseSlug) {
@@ -231,8 +251,8 @@
         return;
     }
 
-    if (targetPhase === 'collect_quizzes') {
-        await setState({ active: true, phase: 'collect_quizzes', courseSlug, quizUrls: [], currentIndex: 0 });
+    if (['collect_quizzes', 'scan_quizzes'].includes(targetPhase)) {
+        await setState({ active: true, phase: targetPhase, courseSlug, quizUrls: [], currentIndex: 0 });
         setStatus('Going to assignments...');
         await delay(400);
         location.href = `https://www.coursera.org/learn/${courseSlug}/home/assignments`;
@@ -282,6 +302,7 @@
     const isChatGPT = aiChoice === 'chatgpt';
     const TASK_KEY = isChatGPT ? 'cqsChatGptTask' : 'cqsClaudeTask';
     const ANSWER_KEY = isChatGPT ? 'cqsChatGptAnswers' : 'cqsClaudeAnswers';
+    const PROGRESS_KEY = isChatGPT ? 'cqsChatGptProgress' : 'cqsClaudeProgress';
     const AI_NAME = isChatGPT ? 'ChatGPT' : 'Claude';
     const OPEN_MSG = isChatGPT ? 'OPEN_CHATGPT_TAB' : 'OPEN_CLAUDE_TAB';
 
@@ -289,6 +310,7 @@
     await waitFor(() => findBlocks().length > 0, 10000);
     const blocks = findBlocks();
     if (!blocks.length) { setStatus('⚠ No questions found on this page'); return; }
+    globalThis.CqsDebug?.log('coursera', 'questions_found', { expected: blocks.length, provider: aiChoice });
 
     // Check if we already answered these newly found questions
     // (A primitive check to prevent infinite loops if something fails)
@@ -366,36 +388,35 @@
     setStatus(`Opening ${AI_NAME} — wait for it to answer...`);
 
     // Clear old answers, store the task payload (including screenshots for vision)
-    await chrome.storage.local.remove([ANSWER_KEY]);
+    await chrome.storage.local.remove([ANSWER_KEY, PROGRESS_KEY]);
     await chrome.storage.local.set({
       [TASK_KEY]: { prompt, taskId, timestamp: startedAt, deadline, expectedAnswers: blockMeta.length, screenshots }
     });
 
     // Ask background to open the tab
-    chrome.runtime.sendMessage({ type: OPEN_MSG });
+    try {
+      const opened = await chrome.runtime.sendMessage({ type: OPEN_MSG, taskId });
+      if (!opened?.ok) throw new Error(opened?.error || 'Could not connect to the AI tab.');
+    } catch (error) {
+      await chrome.storage.local.remove([TASK_KEY]);
+      setStatus(`⚠ ${error.message}`);
+      blocks.forEach(block => showError(block, error.message));
+      return false;
+    }
 
-    // Use the same deadline as the provider bridge, including time to start responding.
     setStatus(`Waiting for ${AI_NAME} to answer...`);
-    let pollCount = 0;
-
-    while (Date.now() < deadline + 5000) {
-      await delay(2000);
-      if (stopRequested) return false;
-      pollCount++;
-
-      const stored = await new Promise(r =>
-        chrome.storage.local.get([ANSWER_KEY, 'cqsBridgeStatus'], d => r(d))
-      );
-
-      const bridgeStatus = stored['cqsBridgeStatus'] || '';
-
-      if (pollCount % 5 === 0) {
-        setStatus(`Still waiting for ${AI_NAME}... (${Math.round((Date.now() - startedAt) / 1000)}s / ${settings.responseTimeoutSeconds}s) ${bridgeStatus}`);
-      }
-
-      if (!stored[ANSWER_KEY]) continue;
-      const ansData = stored[ANSWER_KEY];
-      if (ansData.taskId !== taskId) continue;
+    try {
+      const ansData = await CqsAI.waitForStoredAnswer({ answerKey: ANSWER_KEY, progressKey: PROGRESS_KEY, taskId,
+        timeoutMs: Math.max(0, deadline - Date.now()) + 5000, isCancelled: () => stopRequested,
+        onProgress: progress => {
+          const stage = { finding_editor: 'Finding chat input', inserting_prompt: 'Preparing prompt', sending_prompt: 'Sending prompt',
+            waiting_for_response: 'Waiting for response', generating: 'AI is generating', response_detected: 'Reading response', response_captured: 'Response captured', error: 'AI bridge error' }[progress.stage] || progress.stage;
+          const el = document.getElementById('cqs-status');
+          if (el) el.textContent = `${AI_NAME}: ${stage}${progress.characters ? ` (${progress.characters} characters)` : ''}`;
+        } });
+      globalThis.CqsDebug?.log('coursera', 'answer_received', { taskId, provider: aiChoice, characters: ansData.rawText?.length || 0, answers: ansData.answers?.length || 0 });
+      const pendingTask = await chrome.storage.local.get([TASK_KEY]);
+      if (pendingTask[TASK_KEY]?.taskId === taskId) await chrome.storage.local.remove([TASK_KEY]);
 
       // Error from bridge
       if (ansData.error) {
@@ -412,22 +433,33 @@
       if (hasAnswers || hasRawText) {
         setStatus(`Got ${AI_NAME} response! Filling in answers...`);
 
-        let finalAnswers = ansData.answers || [];
+        let finalAnswers = CqsAI.normalizeAnswers(ansData.answers || []);
 
         // If answers is empty but rawText exists, try re-parsing here
         if (!hasAnswers && hasRawText) {
-          finalAnswers = parseRawText(ansData.rawText);
+          finalAnswers = CqsAI.normalizeAnswers(parseRawText(ansData.rawText));
           console.log('[QuizAI] Re-parsed from rawText:', finalAnswers);
         }
 
         await chrome.storage.local.remove([ANSWER_KEY]);
 
         if (!CqsAI.hasCompleteAnswers(finalAnswers, blockMeta.length)) {
-          setStatus(`⚠ ${AI_NAME}: Incomplete response. Select a provider and try again.`);
-          blocks.forEach(b => showError(b, 'Incomplete response; no answers applied'));
+          const missing = blocks.map((_, index) => index + 1).filter(q => !finalAnswers.some(answer => answer.q === q && answer.a.length));
+          const message = `${AI_NAME}: received ${finalAnswers.length}/${blocks.length} answers. Missing: ${missing.join(', ')}. Open Debug.`;
+          globalThis.CqsDebug?.log('coursera', 'incomplete_answers', { taskId, answers: finalAnswers.length, expected: blocks.length, missing: missing.join(', ') }, 'error');
+          setStatus(`⚠ ${message}`);
+          blocks.forEach(b => showError(b, message));
           return false;
         }
 
+        const invalid = invalidAnswerQuestions(blockMeta, finalAnswers);
+        if (invalid.length) {
+          const message = `${AI_NAME}: invalid or undetected choices for questions ${invalid.join(', ')}. No answers applied. Open Debug.`;
+          globalThis.CqsDebug?.log('coursera', 'invalid_answer_values', { taskId, code: 'INVALID_CHOICES', missing: invalid.join(', ') }, 'error');
+          setStatus(`⚠ ${message}`);
+          blocks.forEach(block => showError(block, message));
+          return false;
+        }
         await applyWebUiAnswers(blockMeta, finalAnswers, AI_NAME);
 
         // Mark as answered to prevent re-running on same block ONLY if successful
@@ -436,13 +468,17 @@
         setStatus(`✅ ${AI_NAME} answered your quiz!`);
         return true;
       }
+      setStatus(`⚠ ${AI_NAME}: response contained no usable answers. Open Debug.`);
+      return false;
+    } catch (error) {
+      const pending = await chrome.storage.local.get([TASK_KEY]);
+      if (pending[TASK_KEY]?.taskId === taskId) await chrome.storage.local.remove([TASK_KEY]);
+      if (!stopRequested) {
+        setStatus(`⚠ ${AI_NAME}: ${error.message}`);
+        blocks.forEach(block => showError(block, error.message));
+      }
+      return false;
     }
-
-    const pending = await chrome.storage.local.get([TASK_KEY]);
-    if (pending[TASK_KEY]?.taskId === taskId) await chrome.storage.local.remove([TASK_KEY]);
-    setStatus(`⏱ Timed out — ${AI_NAME} took too long. Try again.`);
-    blocks.forEach(b => showError(b, `${AI_NAME} timed out`));
-    return false;
   }
 
   // Local fallback parser: extract answers from AI response text
@@ -494,6 +530,19 @@
 
   }
 
+  function invalidAnswerQuestions(blockMeta, aiAnswers) {
+    return blockMeta.flatMap(({ type, opts }, index) => {
+      if (type === 'text') return [];
+      const answer = aiAnswers.find(item => item.q === index + 1);
+      const values = answer?.a || [];
+      const valid = values.length > 0 && (type !== 'radio' || values.length === 1) && values.every(value => {
+        const letter = String(value).trim().toUpperCase();
+        return /^[A-Z]$/.test(letter) && letter.charCodeAt(0) - 65 < opts.length;
+      });
+      return valid ? [] : [index + 1];
+    });
+  }
+
   async function applyWebUiAnswers(blockMeta, aiAnswers, aiName) {
     const answerMap = {};
     for (const item of aiAnswers) {
@@ -510,8 +559,8 @@
         const result = { answers: [], reasoning: letters[0] || '', suggestedText: letters[0] || '', confidence: 88 };
         showAnswer(block, result, [], 'text', aiName);
       } else {
-        const validLetters = letters.map(l => String(l).toUpperCase()).filter(l => /^[A-H]$/.test(l));
-        const result = { answers: validLetters.length ? validLetters : ['A'], reasoning: `Via ${aiName}`, confidence: 92 };
+        const validLetters = letters.map(l => String(l).trim().toUpperCase()).filter(l => /^[A-Z]$/.test(l));
+        const result = { answers: validLetters, reasoning: `Via ${aiName}`, confidence: 92 };
         showAnswer(block, result, opts, type, aiName);
       }
     }
@@ -641,38 +690,33 @@
   // ════════════════════════════════════════════════════════════════════════════
   async function collectQuizzes(state) {
     setStatus('Scanning for quizzes...');
-    await waitFor(() => document.querySelector('a'), 12000);
+    await waitFor(() => CqsQuizzes.scan().items.length > 0, 12000);
     await delay(1000);
-
-    const urls = [];
-    const allLinks = [...document.querySelectorAll('a')];
-    allLinks.forEach(a => {
-        const href = a.href || '';
-        // Look for quiz or exam links
-        if (href.includes('/quiz/') || href.includes('/exam/') || href.includes('/assignment-submission/')) {
-            // Find container to check if it's already done
-            const row = findRowContainer(a);
-            if (row && isRowCompleted(row)) {
-                console.log('[QuizAI] Skipping completed quiz:', href);
-                return;
-            }
-
-            const exists = urls.some(u => (typeof u === 'string' ? u : u.url) === href);
-            if (!exists) {
-                urls.push(href);
-            }
-        }
-    });
-
+    if (stopRequested) return;
+    const scan = CqsQuizzes.scan();
+    await chrome.storage.local.set({ cqsQuizScan: scan });
+    globalThis.CqsDebug?.log('coursera', 'quiz_scan', scan.counts);
+    const urls = scan.items.filter(item => item.queued).map(item => ({ url: item.url, scanStatus: item.status }));
+    const summary = `${scan.counts.total} quizzes: ${scan.counts.completed} completed, ${scan.counts.pending + scan.counts.failed} unfinished, ${scan.counts.waiting} awaiting grade, ${scan.counts.locked} locked, ${scan.counts.unknown} need status check`;
+    setStatus(summary);
+    if (state.phase === 'scan_quizzes') {
+      await clearState();
+      await chrome.runtime.sendMessage({ type: 'OPEN_DEBUG' });
+      return;
+    }
+    if (scan.items.length === 0) {
+      await clearState();
+      setStatus('⚠ No quiz links found. Open the assignments/grades page and expand the quiz list. See Debug.');
+      return;
+    }
     if (!urls.length) {
-        setStatus('✅ No pending quizzes found!');
+        setStatus(`✅ ${summary}. Nothing ready to solve.`);
         await clearState();
         return;
     }
-
-    setStatus(`Found ${urls.length} pending quizzes. Starting...`);
+    setStatus(`${summary}. Starting ${urls.length} queued quizzes...`);
     await delay(600);
-    const newState = { ...state, phase: 'quiz', quizUrls: urls, currentIndex: 0 };
+    const newState = { ...state, phase: 'quiz', quizUrls: urls, currentIndex: 0, results: [] };
     await setState(newState);
     location.href = urls[0].url || urls[0];
   }
@@ -733,6 +777,12 @@
   async function autoSolveAndSubmit(state) {
     const total = state.quizUrls.length;
     const idx = state.currentIndex;
+    const pageStatus = CqsQuizzes.pageStatus();
+    if (['completed', 'submitted'].includes(pageStatus)) {
+      setStatus(`Quiz ${idx + 1} of ${total} — Already ${pageStatus}; skipping.`);
+      await advanceQuiz(state, pageStatus);
+      return;
+    }
 
     setStatus(`Quiz ${idx + 1} of ${total} — Opening...`);
 
@@ -748,8 +798,8 @@
     setStatus(`Quiz ${idx + 1} of ${total} — Answering...`);
     const success = await solveWithSelectedProvider();
     if (!success) {
-      await clearState();
-      if (!stopRequested) setStatus('⏸ No complete answer received. Select an AI provider and try again.');
+      await setState({ ...state, active: false, lastError: 'AI_RESPONSE_FAILED' });
+      globalThis.CqsDebug?.log('coursera', 'queue_paused', { index: idx, code: 'AI_RESPONSE_FAILED' }, 'error');
       return;
     }
 
@@ -760,25 +810,47 @@
 
     // Step E: Submit
     setStatus(`Quiz ${idx + 1} of ${total} — Submitting...`);
-    const submitted = await submitQuiz();
-
-    if (submitted) {
-      setStatus(`Quiz ${idx + 1} of ${total} — Done ✅`);
-    } else {
-      setStatus(`Quiz ${idx + 1} of ${total} — Submit button not found ⚠`);
+    const pending = { ...state, phase: 'awaiting_submission', submissionStartedAt: Date.now() };
+    await setState(pending);
+    if (!await submitQuiz()) {
+      await setState({ ...pending, active: false, lastError: 'SUBMIT_BUTTON_UNAVAILABLE' });
+      setStatus('⚠ Submit button unavailable. Queue paused; check this quiz and Debug.');
+      return;
     }
-    await delay(2500);
+    await reconcileSubmission(pending);
+  }
 
-    // Step F: Move to next quiz or finish
-    const nextIndex = idx + 1;
-    if (nextIndex < total) {
-      const newState = { ...state, currentIndex: nextIndex };
-      await setState(newState);
-      const nextUrl = typeof state.quizUrls[nextIndex] === 'object' ? state.quizUrls[nextIndex].url : state.quizUrls[nextIndex];
-      location.href = nextUrl;
+  async function reconcileSubmission(state) {
+    setStatus('Waiting for Coursera submission confirmation...');
+    const outcome = await waitFor(() => {
+      const status = CqsQuizzes.pageStatus();
+      if (status !== 'unknown') return status;
+      if (/\/view-feedback(?:\/|$)/.test(location.pathname || '') && findBlocks().length === 0) return 'submitted';
+      return null;
+    }, 15000);
+    if (stopRequested) return;
+    if (!outcome) {
+      await setState({ ...state, active: false, lastError: 'SUBMISSION_UNCONFIRMED' });
+      setStatus('⚠ Submission not confirmed. Queue paused; check this quiz and Debug.');
+      return;
+    }
+    await advanceQuiz(state, outcome);
+  }
+
+  async function advanceQuiz(state, outcome) {
+    if (stopRequested) return;
+    const results = [...(state.results || [])];
+    results[state.currentIndex] = { status: outcome, timestamp: Date.now() };
+    await chrome.storage.local.set({ cqsLastQueue: { timestamp: Date.now(), results } });
+    globalThis.CqsDebug?.log('coursera', 'quiz_result', { index: state.currentIndex, stage: outcome });
+    const nextIndex = state.currentIndex + 1;
+    if (nextIndex < state.quizUrls.length) {
+      await setState({ ...state, phase: 'quiz', currentIndex: nextIndex, results });
+      const next = state.quizUrls[nextIndex];
+      location.href = typeof next === 'string' ? next : next.url;
     } else {
       await clearState();
-      setStatus(`✅ All ${total} quizzes completed!`);
+      setStatus(`Queue finished: ${results.filter(item => item?.status === 'completed').length} passed/completed; ${results.filter(item => item?.status === 'submitted').length} submitted; ${results.filter(item => item?.status === 'failed').length} failed.`);
       await delay(2000);
       location.href = `https://www.coursera.org/learn/${state.courseSlug}/home/assignments`;
     }
@@ -1176,10 +1248,7 @@
       return false;
     }
 
-    // Click multiple times to ensure the click registers through React interceptors
     await delay(300); // final breathing room
-    pageSubmit.click();
-    await delay(300);
     pageSubmit.click();
     await delay(1000);
 
@@ -1187,8 +1256,6 @@
     const modalSubmitBtn = await waitForModalSubmit(5000);
     if (modalSubmitBtn) {
       modalSubmitBtn.click();
-      await delay(300);
-      modalSubmitBtn.click(); // Double tap modal submit too
       await delay(2500);
     }
 
@@ -1332,15 +1399,28 @@
       });
     }
 
-    // ── Sort results by vertical DOM position to preserve quiz order ─────────
-    results.sort((a, b) => {
+    const controlsFor = node => [...node.querySelectorAll('input:not([type="hidden"]), textarea, [contenteditable="true"]')];
+    const visible = results.filter(node => CqsAI.isVisible(node) && controlsFor(node).length > 0);
+    const unique = visible.filter(node => {
+      const controls = controlsFor(node);
+      return !visible.some(other => {
+        if (other === node) return false;
+        const others = controlsFor(other);
+        // Prefer the full question over nested editor wrappers with the same controls.
+        if (other.contains(node) && others.length === controls.length && controls.every(control => others.includes(control))) return true;
+        // Drop a broad quiz wrapper that contains distinct, smaller question parts.
+        return node.contains(other) && others.length < controls.length && /Question$/.test(other.getAttribute('data-testid') || '');
+      });
+    });
+    // Sort only distinct visible question parts; wrappers can otherwise double the expected answer count.
+    unique.sort((a, b) => {
       const ra = a.getBoundingClientRect();
       const rb = b.getBoundingClientRect();
       return (ra.top + window.scrollY) - (rb.top + window.scrollY);
     });
 
-    console.log(`[QuizAI] findBlocks() found ${results.length} question(s)`);
-    return results;
+    console.log(`[QuizAI] findBlocks() found ${unique.length} question(s)`);
+    return unique;
   }
 
 
@@ -1448,6 +1528,7 @@
 
     // Text input with <input type="text">
     if (b.querySelector('input[type="text"]')) return 'text';
+    if (b.querySelector('[contenteditable="true"]')) return 'text';
 
     return 'radio'; // default fallback for MCQ
   }
@@ -1848,8 +1929,12 @@
   //  MESSAGE LISTENER (for popup buttons)
   // ════════════════════════════════════════════════════════════════════════════
   chrome.runtime.onMessage.addListener((msg, _, sendResponse) => {
+    if (msg.type === 'CQS_CONTENT_PING') {
+      sendResponse({ ok: true, version: contentVersion });
+      return false;
+    }
     if (msg.type === 'TRIGGER_START') {
-      startPipeline();
+      startPipeline(msg.phase || 'collect_quizzes').catch(error => setStatus(`⚠ ${error.message}. Open Debug.`));
       sendResponse({ ok: true });
     }
 
@@ -1867,7 +1952,6 @@
         setStatus('Answering questions...');
         const success = await solveWithSelectedProvider();
         if (!success) {
-          if (!stopRequested) setStatus('⏸ No complete answer received. Select an AI provider and try again.');
           return;
         }
 
@@ -1877,8 +1961,8 @@
 
         setStatus('Submitting...');
         const submitted = await submitQuiz();
-        setStatus(submitted ? '✅ Submitted!' : '⚠ Submit button not found — check manually');
-      })();
+        setStatus(submitted ? 'Submit clicked. Check the Coursera result.' : '⚠ Submit button not found — check manually');
+      })().catch(error => setStatus(`⚠ ${error.message}. Open Debug.`));
       sendResponse({ ok: true });
     }
 
@@ -1890,9 +1974,9 @@
 
   // ─── Run ──────────────────────────────────────────────────────────────────
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => setTimeout(init, 1200));
+    document.addEventListener('DOMContentLoaded', () => setTimeout(() => init().catch(error => setStatus(`⚠ ${error.message}. Open Debug.`)), 1200));
   } else {
-    setTimeout(init, 1200);
+    setTimeout(() => init().catch(error => setStatus(`⚠ ${error.message}. Open Debug.`)), 1200);
   }
 
 })();

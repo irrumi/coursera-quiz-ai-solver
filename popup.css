@@ -154,6 +154,9 @@ body {
   gap: 6px;
 }
 
+.debug-actions { display: flex; gap: 8px; margin-top: 10px; }
+.debug-actions button { flex: 1; padding: 9px 8px; border: 1px solid var(--border-hi); border-radius: var(--r-sm); background: var(--bg-card); color: var(--text-2); cursor: pointer; font: inherit; }
+
 .provider-buttons button {
   flex: 1;
   padding: 9px 6px;
