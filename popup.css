@@ -149,6 +149,52 @@ body {
   color: var(--text-2);
 }
 
+.provider-buttons {
+  display: flex;
+  gap: 6px;
+}
+
+.provider-buttons button {
+  flex: 1;
+  padding: 9px 6px;
+  border: 1px solid var(--border-hi);
+  border-radius: var(--r-sm);
+  background: var(--bg-card);
+  color: var(--text-2);
+  cursor: pointer;
+  font: inherit;
+}
+
+.provider-buttons button[aria-pressed="true"] {
+  border-color: var(--primary);
+  background: var(--primary-dim);
+  color: var(--primary);
+  font-weight: 600;
+}
+
+.provider-help {
+  color: var(--text-2);
+  font-size: 11px;
+  margin: 8px 0 12px;
+}
+
+.timeout-label {
+  display: block;
+  font-size: 12px;
+  margin-bottom: 5px;
+  color: var(--text-2);
+}
+
+#response-timeout {
+  width: 100%;
+  padding: 8px;
+  border: 1px solid var(--border-hi);
+  border-radius: var(--r-sm);
+  background: var(--bg-card);
+  color: var(--text);
+  font: inherit;
+}
+
 /* ─── Section & Label ────────────────────────────────────── */
 .section {
   margin-bottom: 24px;

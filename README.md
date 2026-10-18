@@ -127,7 +127,19 @@ https://chatgpt.com/
 https://claude.ai/
 ```
 
-Best setup: keep both ChatGPT and Claude open so the extension has a fallback path.
+Choose an AI provider in the extension popup or the Coursera toolbar:
+
+| Mode | Behavior |
+| --- | --- |
+| ChatGPT (default) | Uses ChatGPT only; does not switch to Claude on failure or quiz retry |
+| Claude | Uses Claude only |
+| Auto | Tries ChatGPT, then Claude if ChatGPT fails |
+
+The response wait defaults to **10 minutes**. Choose 5, 10, 20, or 30 minutes in the popup, toolbar, or extension settings. Provider and wait preferences are saved for the next request. Keep both AI tabs available if you choose Auto.
+
+Long responses are stored in full. The bridge waits until generation stops and the response settles; a timeout does not apply a partially generated answer. Text-answer cards display the full text in a scrollable area and include a **Copy answer** button.
+
+After updating an unpacked copy, click **Reload** on `chrome://extensions/` and refresh the Coursera and AI tabs.
 
 ---
 
@@ -165,7 +177,7 @@ No OpenAI API key. No Anthropic API key. No billing setup. The extension uses yo
 
 ### ChatGPT + Claude
 
-Use ChatGPT as the main AI path and Claude as a fallback when responses are slow, blocked, or hard to parse.
+Choose ChatGPT or Claude explicitly, or enable Auto to allow a fallback from ChatGPT to Claude.
 
 </td>
 </tr>
@@ -358,7 +370,7 @@ Coursera changes layouts often. Refresh the page and try again. If it keeps happ
 | Do I need an OpenAI API key? | No. It uses the ChatGPT website in your browser. |
 | Do I need an Anthropic API key? | No. It uses the Claude website in your browser. |
 | Does it work on Edge? | It should work on Chromium browsers that support unpacked Manifest V3 extensions. |
-| Why keep both ChatGPT and Claude open? | One can act as a fallback when the other is slow or returns a hard-to-parse answer. |
+| Why keep both ChatGPT and Claude open? | Auto mode can fall back from ChatGPT to Claude. The default ChatGPT mode does not switch providers. |
 | Does it support peer assignments? | Yes, as a feature inside Coursera Quiz AI Solver. |
 | Is it official? | No. It is independent and not affiliated with Coursera, OpenAI, Anthropic, Google, or Chrome. |
 | What is the correct zip name? | `coursera-quiz-ai-solver.zip` |
@@ -395,6 +407,7 @@ Most users can stop reading here. The sections below are for maintainers and con
 .
 |-- manifest.json          # Chrome extension manifest, permissions, content scripts
 |-- background.js          # Service worker: opens ChatGPT/Claude tabs and capture bridge
+|-- ai_common.js           # Provider settings, full-response waiting, JSON extraction
 |-- content.js             # Coursera toolbar, parser, queue state, quiz and peer workflows
 |-- chatgpt_bridge.js      # ChatGPT prompt injection and response parsing
 |-- claude_bridge.js       # Claude prompt injection and response parsing
@@ -506,10 +519,12 @@ Run syntax checks:
 
 ```bash
 node --check background.js
+node --check ai_common.js
 node --check content.js
 node --check chatgpt_bridge.js
 node --check claude_bridge.js
 node --check popup.js
+node --check options.js
 ```
 
 Run the parser smoke test:
@@ -518,10 +533,24 @@ Run the parser smoke test:
 node test_parser_2.js
 ```
 
+Run response-wait, long-answer, provider-choice, and failure-path regression tests (Node.js 18+):
+
+```bash
+node --test tests/ai.test.cjs
+```
+
+Optional browser checks require Playwright and Chromium (or set `CQS_BROWSER_CHANNEL=chrome` for an installed Chrome):
+
+```bash
+node tests/browser-smoke.cjs
+```
+
+These checks use local fixtures and mocked extension storage. They verify UI choices, persistence, and full text insertion/display/clipboard handling, rather than live provider compatibility.
+
 Package the extension:
 
 ```bash
-git archive --format=zip --output coursera-quiz-ai-solver.zip HEAD manifest.json background.js content.js chatgpt_bridge.js claude_bridge.js popup.html popup.css popup.js options.html options.js icons
+git archive --format=zip --output coursera-quiz-ai-solver.zip HEAD manifest.json background.js ai_common.js content.js chatgpt_bridge.js claude_bridge.js popup.html popup.css popup.js options.html options.js icons
 ```
 
 </details>
@@ -535,7 +564,6 @@ git archive --format=zip --output coursera-quiz-ai-solver.zip HEAD manifest.json
 | Review-before-submit mode | Gives users more control |
 | First-run setup screen | Makes onboarding easier |
 | Demo screenshots and GIFs | Makes the README more visual |
-| Provider selector | Lets users choose ChatGPT, Claude, or auto |
 | Privacy mode | Allows users to disable visual capture |
 | Narrower permissions | Reduces browser permission scope |
 | Better settings wiring | Makes options page more useful |

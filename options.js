@@ -2,7 +2,7 @@
 // (Must be a separate file — inline scripts are blocked by Chrome Extension CSP)
 
 const DEFAULT_SETTINGS = {
-    model: 'gemini-2.0-flash',   // current default — gemini-1.5-flash was deprecated
+    ...CqsAI.DEFAULT_SETTINGS,
     language: 'English',
     showConfidence: true,
     showReasoning: true,
@@ -13,7 +13,9 @@ const DEFAULT_SETTINGS = {
 // Load saved settings
 chrome.storage.sync.get(['settings'], (data) => {
     const s = data.settings || {};
-    if (s.model) document.getElementById('opt-model').value = s.model;
+    const aiSettings = CqsAI.normalizeSettings(s);
+    document.getElementById('opt-provider').value = aiSettings.provider;
+    document.getElementById('opt-response-timeout').value = String(aiSettings.responseTimeoutSeconds);
     if (s.language) document.getElementById('opt-language').value = s.language;
     if (s.showConfidence !== undefined) document.getElementById('opt-show-confidence').checked = s.showConfidence;
     if (s.showReasoning !== undefined) document.getElementById('opt-show-reasoning').checked = s.showReasoning;
@@ -22,18 +24,18 @@ chrome.storage.sync.get(['settings'], (data) => {
 });
 
 // Save settings
-document.getElementById('save-all-btn').addEventListener('click', () => {
+document.getElementById('save-all-btn').addEventListener('click', async () => {
     const settings = {
-        model: document.getElementById('opt-model').value,
+        provider: document.getElementById('opt-provider').value,
+        responseTimeoutSeconds: Number(document.getElementById('opt-response-timeout').value),
         language: document.getElementById('opt-language').value,
         showConfidence: document.getElementById('opt-show-confidence').checked,
         showReasoning: document.getElementById('opt-show-reasoning').checked,
         highlight: document.getElementById('opt-highlight').checked,
         autoSolve: document.getElementById('opt-auto-solve').checked
     };
-    chrome.storage.sync.set({ settings }, () => {
-        const msg = document.getElementById('saved-msg');
-        msg.classList.add('show');
-        setTimeout(() => msg.classList.remove('show'), 3000);
-    });
+    await CqsAI.saveSettings(settings);
+    const msg = document.getElementById('saved-msg');
+    msg.classList.add('show');
+    setTimeout(() => msg.classList.remove('show'), 3000);
 });

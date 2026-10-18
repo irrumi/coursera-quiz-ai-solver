@@ -5,6 +5,7 @@
 
     const TASK_KEY = 'cqsChatGptTask';
     const ANSWER_KEY = 'cqsChatGptAnswers';
+    let activeTaskId = null;
 
     // CHATGPT_PROCESSING_PHRASES detects temporary blocks. Defined globally to avoid TDZ errors.
     const CHATGPT_PROCESSING_PHRASES = [
@@ -15,19 +16,22 @@
 
     // ── Listen for new tasks when the tab is reused ───────────────────────────
     chrome.storage.onChanged.addListener((changes, namespace) => {
-        if (namespace === 'local' && changes[TASK_KEY]?.newValue) {
-            handleTask(changes[TASK_KEY].newValue);
+        if (namespace === 'local' && changes[TASK_KEY]) {
+            if (changes[TASK_KEY].newValue) handleTask(changes[TASK_KEY].newValue);
+            else activeTaskId = null;
         }
     });
 
     // ── Check for a pending task on initial load ──────────────────────────────
     const storage = await chrome.storage.local.get([TASK_KEY]);
-    if (storage[TASK_KEY]) {
+    if (storage[TASK_KEY] && !activeTaskId) {
         handleTask(storage[TASK_KEY]);
     }
 
     async function handleTask(task) {
-        if (!task?.prompt) return;
+        if (!task?.prompt || activeTaskId === task.taskId) return;
+        activeTaskId = task.taskId;
+        const deadline = task.deadline || Date.now() + CqsAI.DEFAULT_SETTINGS.responseTimeoutSeconds * 1000;
 
         console.log('[QuizAI Bridge] ✅ Task found. Prompt length:', task.prompt.length);
 
@@ -49,8 +53,7 @@
 
         // ── 3. Snapshot baseline BEFORE sending ──────────────────────────────────────
         const RESPONSE_SELS = [
-            'div[data-message-author-role="assistant"]',
-            'div[data-message-author-role="tool"]'
+            'div[data-message-author-role="assistant"]'
         ];
 
         function getAllResponseEls() {
@@ -66,6 +69,7 @@
         const baselineEls = getAllResponseEls();
         const baselineCount = baselineEls.length;
         const baselineIds = new Set(baselineEls.map(el => el.getAttribute('data-message-id')).filter(Boolean));
+        const baselineNodes = new Set(baselineEls);
         console.log('[QuizAI Bridge] Baseline captured. Count:', baselineCount, 'IDs tracked:', baselineIds.size);
 
         // ── 4. Paste question screenshots (for vision/image questions) ────────────
@@ -113,6 +117,8 @@
             'button[aria-label="Send message"]'
         ], 5000);
 
+        if (activeTaskId !== task.taskId) return;
+
         if (sendBtn && !sendBtn.disabled) {
             console.log('[QuizAI Bridge] Clicking Send...');
             sendBtn.click();
@@ -126,45 +132,26 @@
         console.log('[QuizAI Bridge] Message sent. Waiting for NEW response elements...');
         await delay(3000); // give ChatGPT time to start generating
 
-        // ── 7. Wait for a NEW response element to appear ───────
-        const newEls = await waitFor(
-            () => {
-                const all = getAllResponseEls();
-                if (!all.length) return null;
-
-                // 1. If we find an assistant element with a brand new data-message-id, it's our new block!
-                const newBubble = all.find(el => {
+        let responseText;
+        try {
+            responseText = await CqsAI.waitForResponse(() => {
+                const fresh = getAllResponseEls().filter(el => {
                     const id = el.getAttribute('data-message-id');
-                    return id && !baselineIds.has(id);
+                    return id ? !baselineIds.has(id) : !baselineNodes.has(el);
                 });
-                if (newBubble) return [newBubble];
-
-                // 2. Fallback: if data-message-id is disabled/missing, just ensure count strictly increased
-                if (baselineCount > 0 && all.length > baselineCount) return all;
-
-                return null;
-            },
-            60000
-        );
-
-        if (!newEls) {
-            await storeError('ChatGPT did not generate a response in time. Try again.');
+                return fresh.map(el => el.innerText || '').join('\n\n').trim();
+            }, {
+                timeoutMs: deadline - Date.now(),
+                isProcessing: isChatGPTProcessing,
+                isComplete: text => CqsAI.hasCompleteAnswers(
+                    parseChatGPTResponse(text, text.includes('"answers"')).answers, task.expectedAnswers
+                ),
+                isCancelled: () => activeTaskId !== task.taskId,
+            });
+        } catch (error) {
+            if (activeTaskId === task.taskId) await storeError(error.message);
             return;
         }
-
-        console.log('[QuizAI Bridge] New response text detected.');
-
-        // Wait for ChatGPT's streaming to finish (stable text = done)
-        const responseText = await waitForStableText(() => {
-            const all = getAllResponseEls();
-            if (!all.length) return '';
-            const last = all[all.length - 1];
-            if (last.getAttribute('data-message-author-role') === 'tool') {
-                return '[TOOL_PROCESSING]';
-            }
-            // Just read the absolute last output block, immune to SPA unmounts
-            return (last.innerText || '').trim();
-        }, 120000);
 
         console.log('[QuizAI Bridge] Stable response (', responseText.length, ' chars)');
 
@@ -176,6 +163,7 @@
         // ── 8. Parse and store ───────────────────────────────────────────────────────
         // parseChatGPTResponse returns { answers, uploadFileSvg }
         const { answers, uploadFileSvg } = parseChatGPTResponse(responseText);
+        if (activeTaskId !== task.taskId) return;
         console.log('[QuizAI Bridge] Parsed', answers.length, 'answers:', JSON.stringify(answers));
         if (uploadFileSvg) console.log('[QuizAI Bridge] Got uploadFileSvg (' + uploadFileSvg.length + ' chars)');
 
@@ -183,7 +171,7 @@
             [ANSWER_KEY]: {
                 answers,
                 uploadFileSvg: uploadFileSvg || null,  // pass through to content.js for file upload
-                rawText: responseText.slice(0, 5000),
+                rawText: responseText,
                 taskId: task.taskId,
                 timestamp: Date.now(),
             }
@@ -241,78 +229,17 @@
             }
         }
 
-        function waitFor(fn, maxMs) {
-            return new Promise(resolve => {
-                const r = fn(); if (r) { resolve(r); return; }
-                const start = Date.now();
-                const id = setInterval(() => {
-                    const r2 = fn();
-                    if (r2 || Date.now() - start > maxMs) { clearInterval(id); resolve(r2 || null); }
-                }, 600);
-            });
-        }
-
-
-
         function isChatGPTProcessing(text) {
             if (text === '[TOOL_PROCESSING]') return true;
-            if (document.querySelector('button[aria-label="Stop generating"], button[data-testid="stop-button"]')) return true;
+            if (document.querySelector('button[aria-label*="Stop" i], button[data-testid="stop-button"], [data-is-streaming="true"], [data-message-author-role="assistant"][aria-busy="true"]')) return true;
             if (!text) return false;
             return CHATGPT_PROCESSING_PHRASES.some(re => re.test(text));
-        }
-
-        function waitForStableText(getText, maxMs) {
-            return new Promise(resolve => {
-                let last = '', stableCount = 0;
-                const start = Date.now();
-                const id = setInterval(() => {
-                    const cur = getText();
-                    if (cur && cur === last && cur.length > 5) {
-                        if (isChatGPTProcessing(cur)) {
-                            // ChatGPT is in an intermediate state (Analyzing), keep waiting
-                            stableCount = 0;
-                            last = ''; // force re-read
-                            console.log('[QuizAI Bridge] Temporarily processing, still waiting...', cur.slice(0, 60));
-                        } else {
-                            stableCount++;
-                            const needed = cur.length > 300 ? 2 : 3;
-                            if (stableCount >= needed) { clearInterval(id); resolve(cur); return; }
-                        }
-                    } else {
-                        stableCount = 0; last = cur;
-                        // If Chrome has background-throttled the tab, setInterval drops to 1 min.
-                        // Bypass: If the text is already completely valid JSON, resolve instantly!
-                        if (cur && cur.includes('"answers"')) {
-                            const parsed = parseChatGPTResponse(cur, true);
-                            if (parsed && parsed.answers && parsed.answers.length > 0) {
-                                clearInterval(id); resolve(cur); return;
-                            }
-                        }
-                    }
-                    if (Date.now() - start > maxMs) { clearInterval(id); resolve(last); }
-                }, 800);
-            });
         }
 
         // Returns { answers: [...], uploadFileSvg: "<svg>...</svg>" | null }
         function parseChatGPTResponse(text, skipRegexFallback = false) {
             // 1. Brace-balanced JSON extraction
-            const candidates = [];
-            let depth = 0, start = -1;
-            for (let i = 0; i < text.length; i++) {
-                if (text[i] === '{') {
-                    if (depth === 0) start = i;
-                    depth++;
-                } else if (text[i] === '}') {
-                    if (depth > 0) {
-                        depth--;
-                        if (depth === 0 && start !== -1) {
-                            candidates.push(text.slice(start, i + 1));
-                            start = -1;
-                        }
-                    }
-                }
-            }
+            const candidates = CqsAI.extractJsonObjects(text);
 
             // Try largest candidate first — also extract root-level uploadFileSvg
             for (const candidate of [...candidates].reverse()) {
@@ -394,6 +321,7 @@
         }
 
         async function storeError(msg) {
+            if (activeTaskId !== task.taskId) return;
             console.error('[QuizAI Bridge] ERROR:', msg);
             await chrome.storage.local.set({ [ANSWER_KEY]: { error: msg, taskId: task.taskId, timestamp: Date.now() } });
             await chrome.storage.local.remove([TASK_KEY]);

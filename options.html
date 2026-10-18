@@ -205,12 +205,20 @@
         <div class="card">
             <div class="card-title">AI Model</div>
             <div class="field">
-                <label>Gemini Model</label>
-                <select id="opt-model">
-                    <option value="gemini-2.0-flash">gemini-2.0-flash (Default — Free, Fastest)</option>
-                    <option value="gemini-2.0-flash-lite">gemini-2.0-flash-lite (Lightest, most free)</option>
-                    <option value="gemini-1.5-flash-latest">gemini-1.5-flash-latest (Stable, free)</option>
-                    <option value="gemini-1.5-pro-latest">gemini-1.5-pro-latest (Most accurate)</option>
+                <label for="opt-provider">AI Provider</label>
+                <select id="opt-provider">
+                    <option value="chatgpt">ChatGPT only (Default — no automatic switch)</option>
+                    <option value="claude">Claude only (No automatic switch)</option>
+                    <option value="auto">Auto: ChatGPT, then Claude on failure</option>
+                </select>
+            </div>
+            <div class="field">
+                <label for="opt-response-timeout">Response wait time</label>
+                <select id="opt-response-timeout">
+                    <option value="300">5 minutes</option>
+                    <option value="600" selected>10 minutes (Default)</option>
+                    <option value="1200">20 minutes</option>
+                    <option value="1800">30 minutes</option>
                 </select>
             </div>
             <div class="field">
@@ -279,11 +287,11 @@
             <div class="card-title">About</div>
             <div class="row">
                 <div class="row-label">Version</div>
-                <span style="color:#64748b;font-size:12px;">6.1.1</span>
+                <span style="color:#64748b;font-size:12px;">6.1.2</span>
             </div>
             <div class="row">
-                <div class="row-label">API Provider</div>
-                <span style="color:#64748b;font-size:12px;">Google Gemini (Free tier)</span>
+                <div class="row-label">Connection</div>
+                <span style="color:#64748b;font-size:12px;">ChatGPT / Claude web tabs</span>
             </div>
             <div class="row" style="border-bottom:none;">
                 <div class="row-label">Keyboard shortcut</div>
@@ -295,6 +303,7 @@
         <div class="saved-msg" id="saved-msg">✓ Settings saved!</div>
     </div>
 
+    <script src="ai_common.js"></script>
     <script src="options.js"></script>
 </body>
 

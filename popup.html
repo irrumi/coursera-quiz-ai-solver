@@ -33,6 +33,23 @@
       </div>
     </div>
 
+    <div class="section ai-settings">
+      <div class="label" id="provider-label">AI provider</div>
+      <div class="provider-buttons" role="group" aria-labelledby="provider-label">
+        <button type="button" data-provider="chatgpt" aria-pressed="true" disabled>ChatGPT</button>
+        <button type="button" data-provider="claude" aria-pressed="false" disabled>Claude</button>
+        <button type="button" data-provider="auto" aria-pressed="false" disabled>Auto</button>
+      </div>
+      <p class="provider-help" id="provider-help">Uses ChatGPT only. No automatic switch.</p>
+      <label class="timeout-label" for="response-timeout">Response wait</label>
+      <select id="response-timeout" disabled>
+        <option value="300">5 minutes</option>
+        <option value="600" selected>10 minutes</option>
+        <option value="1200">20 minutes</option>
+        <option value="1800">30 minutes</option>
+      </select>
+    </div>
+
     <!-- ── Actions ──────────────────────────────────────────── -->
     <div class="section">
       <div class="label"><span>Actions (Runs on Active Tab)</span></div>
@@ -81,10 +98,11 @@
         <span>Made by</span>
         <a href="https://aburahatsabir.vercel.app/" target="_blank" class="author-link">Abu Rahat Sabir</a>
       </div>
-      <span class="footer-version">v6.1.1 WEB-UI</span>
+      <span class="footer-version">v6.1.2 WEB-UI</span>
     </div>
 
   </div>
+  <script src="ai_common.js"></script>
   <script src="popup.js"></script>
 </body>
 

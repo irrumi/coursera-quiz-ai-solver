@@ -18,6 +18,9 @@
   //            in the master queue. This separation prevents autoSolveAndSubmit
   //            from being dispatched on peer review pages (BUG-01).
   const STATE_KEY = 'cqsAutoState';
+  let aiSettings = CqsAI.normalizeSettings();
+  let settingsSave = Promise.resolve();
+  let stopRequested = false;
 
   // ─── Detect page context ───────────────────────────────────────────────────
   const href = location.href;
@@ -40,6 +43,7 @@
   // ════════════════════════════════════════════════════════════════════════════
   async function init() {
     injectStyles();
+    aiSettings = await CqsAI.getSettings();
 
     const state = await getState();
 
@@ -120,9 +124,25 @@
       </div>
     `;
 
+    const providerHtml = `
+      <div class="cqs-ai-controls">
+        <label for="cqs-provider">AI provider</label>
+        <select id="cqs-provider">
+          <option value="chatgpt">ChatGPT only</option>
+          <option value="claude">Claude only</option>
+          <option value="auto">Auto: ChatGPT → Claude</option>
+        </select>
+        <label for="cqs-response-timeout">Response wait</label>
+        <select id="cqs-response-timeout">
+          ${CqsAI.TIMEOUT_OPTIONS.map(seconds => `<option value="${seconds}">${seconds / 60} min</option>`).join('')}
+        </select>
+      </div>
+    `;
+
     if (showStart) {
       t.innerHTML = `
         ${logoHtml}
+        ${providerHtml}
         <div style="display: flex; gap: 8px;">
           <button id="cqs-start-btn" data-phase="${targetPhase}">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polyline></svg>
@@ -139,6 +159,7 @@
     } else {
       t.innerHTML = `
         ${logoHtml}
+        ${providerHtml}
         ${statusHtml}
         <button id="cqs-stop-btn">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12"></rect></svg>
@@ -148,6 +169,24 @@
     }
 
     document.body.appendChild(t);
+
+    const providerSelect = document.getElementById('cqs-provider');
+    const timeoutSelect = document.getElementById('cqs-response-timeout');
+    providerSelect.value = aiSettings.provider;
+    timeoutSelect.value = String(aiSettings.responseTimeoutSeconds);
+    const saveAiSettings = () => {
+      const selected = CqsAI.normalizeSettings({ provider: providerSelect.value, responseTimeoutSeconds: timeoutSelect.value });
+      aiSettings = selected;
+      settingsSave = settingsSave.then(() => CqsAI.saveSettings(selected));
+    };
+    providerSelect.addEventListener('change', saveAiSettings);
+    timeoutSelect.addEventListener('change', saveAiSettings);
+    chrome.storage.onChanged.addListener((changes, namespace) => {
+      if (namespace !== 'sync' || !changes.settings) return;
+      aiSettings = CqsAI.normalizeSettings(changes.settings.newValue);
+      providerSelect.value = aiSettings.provider;
+      timeoutSelect.value = String(aiSettings.responseTimeoutSeconds);
+    });
 
     document.getElementById('cqs-start-btn')?.addEventListener('click', (e) => {
       startPipeline(e.currentTarget.getAttribute('data-phase'));
@@ -172,6 +211,8 @@
   //  PIPELINE ENTRY POINT
   // ════════════════════════════════════════════════════════════════════════════
   async function startPipeline(targetPhase = 'quiz') {
+    await settingsSave;
+    stopRequested = false;
     if (!courseSlug) {
       setStatus('⚠ Not on a Coursera course page');
       return;
@@ -212,7 +253,9 @@
   }
 
   async function stopPipeline() {
+    stopRequested = true;
     await clearState();
+    await chrome.storage.local.remove(['cqsChatGptTask', 'cqsClaudeTask']);
     setStatus('Stopped');
     const btn = document.getElementById('cqs-stop-btn');
     if (btn) {
@@ -224,9 +267,17 @@
   // ════════════════════════════════════════════════════════════════════════════
   //  WEB UI SOLVER (ChatGPT / Claude)
   // ════════════════════════════════════════════════════════════════════════════
-  async function solveWithWebUI(forceAiChoice = null) {
-    // Default to ChatGPT, but allow fallback to Claude
-    const aiChoice = forceAiChoice || 'chatgpt';
+  async function solveWithSelectedProvider() {
+    await settingsSave;
+    const settings = await CqsAI.getSettings();
+    return CqsAI.runWithProviders(settings.provider,
+      provider => stopRequested ? false : solveWithWebUI(provider, settings),
+      () => {
+        if (!stopRequested) setStatus('Auto mode: ChatGPT failed. Trying Claude...');
+      });
+  }
+
+  async function solveWithWebUI(aiChoice = 'chatgpt', settings = CqsAI.DEFAULT_SETTINGS) {
 
     const isChatGPT = aiChoice === 'chatgpt';
     const TASK_KEY = isChatGPT ? 'cqsChatGptTask' : 'cqsClaudeTask';
@@ -307,6 +358,9 @@
     const prompt = promptLines.join('\n');
     const taskId = Date.now().toString();
     const screenshots = Object.entries(screenshotMap).map(([q, dataUrl]) => ({ q: parseInt(q), dataUrl }));
+    if (stopRequested) return false;
+    const startedAt = Date.now();
+    const deadline = startedAt + settings.responseTimeoutSeconds * 1000;
 
     blocks.forEach(showLoader);
     setStatus(`Opening ${AI_NAME} — wait for it to answer...`);
@@ -314,20 +368,19 @@
     // Clear old answers, store the task payload (including screenshots for vision)
     await chrome.storage.local.remove([ANSWER_KEY]);
     await chrome.storage.local.set({
-      [TASK_KEY]: { prompt, taskId, timestamp: Date.now(), screenshots }
+      [TASK_KEY]: { prompt, taskId, timestamp: startedAt, deadline, expectedAnswers: blockMeta.length, screenshots }
     });
 
     // Ask background to open the tab
     chrome.runtime.sendMessage({ type: OPEN_MSG });
 
-    // Poll for answers (up to 3 minutes)
+    // Use the same deadline as the provider bridge, including time to start responding.
     setStatus(`Waiting for ${AI_NAME} to answer...`);
-    const deadline = Date.now() + 180000;
-    let answeredQuiz = false;
     let pollCount = 0;
 
-    while (Date.now() < deadline) {
+    while (Date.now() < deadline + 5000) {
       await delay(2000);
+      if (stopRequested) return false;
       pollCount++;
 
       const stored = await new Promise(r =>
@@ -337,11 +390,12 @@
       const bridgeStatus = stored['cqsBridgeStatus'] || '';
 
       if (pollCount % 5 === 0) {
-        setStatus(`Still waiting for ${AI_NAME}... (${Math.round((Date.now() - (deadline - 180000)) / 1000)}s) [${bridgeStatus}]`);
+        setStatus(`Still waiting for ${AI_NAME}... (${Math.round((Date.now() - startedAt) / 1000)}s / ${settings.responseTimeoutSeconds}s) ${bridgeStatus}`);
       }
 
       if (!stored[ANSWER_KEY]) continue;
       const ansData = stored[ANSWER_KEY];
+      if (ansData.taskId !== taskId) continue;
 
       // Error from bridge
       if (ansData.error) {
@@ -366,26 +420,26 @@
           console.log('[QuizAI] Re-parsed from rawText:', finalAnswers);
         }
 
-        await applyWebUiAnswers(blockMeta, finalAnswers, AI_NAME);
         await chrome.storage.local.remove([ANSWER_KEY]);
 
-        // Check if parsing yielded actual answers
-        if (finalAnswers.length === 0) {
-          setStatus(`⚠ ${AI_NAME}: Failed to parse answers`);
-          blocks.forEach(b => showError(b, `Failed to parse answers`));
-          return false; // Parsing failed -> Failure
+        if (!CqsAI.hasCompleteAnswers(finalAnswers, blockMeta.length)) {
+          setStatus(`⚠ ${AI_NAME}: Incomplete response. Select a provider and try again.`);
+          blocks.forEach(b => showError(b, 'Incomplete response; no answers applied'));
+          return false;
         }
+
+        await applyWebUiAnswers(blockMeta, finalAnswers, AI_NAME);
 
         // Mark as answered to prevent re-running on same block ONLY if successful
         if (firstQKey) answered.set(firstQKey, true);
-
-        setStatus(`✅ ${AI_NAME} answered your quiz!`);
 
         setStatus(`✅ ${AI_NAME} answered your quiz!`);
         return true;
       }
     }
 
+    const pending = await chrome.storage.local.get([TASK_KEY]);
+    if (pending[TASK_KEY]?.taskId === taskId) await chrome.storage.local.remove([TASK_KEY]);
     setStatus(`⏱ Timed out — ${AI_NAME} took too long. Try again.`);
     blocks.forEach(b => showError(b, `${AI_NAME} timed out`));
     return false;
@@ -394,22 +448,7 @@
   // Local fallback parser: extract answers from AI response text
   function parseRawText(text) {
     // 1. Try brace-balanced JSON extraction (handles extra text around JSON)
-    const candidates = [];
-    let depth = 0, start = -1;
-    for (let i = 0; i < text.length; i++) {
-      if (text[i] === '{') {
-        if (depth === 0) start = i;
-        depth++;
-      } else if (text[i] === '}') {
-        if (depth > 0) {
-          depth--;
-          if (depth === 0 && start !== -1) {
-            candidates.push(text.slice(start, i + 1));
-            start = -1;
-          }
-        }
-      }
-    }
+    const candidates = CqsAI.extractJsonObjects(text);
     // Try largest candidate first (most complete), smallest last
     for (const candidate of [...candidates].reverse()) {
       try {
@@ -618,17 +657,9 @@
                 return;
             }
 
-            // Check if this quiz was previously failed
-            let forceClaude = false;
-            if (row && (row.innerText || '').toLowerCase().includes("didn't pass")) {
-                forceClaude = true;
-                console.log('[QuizAI] Found broken/failed quiz, forcing Claude:', href);
-            }
-
-            // push an object instead of string so it can carry forceClaude flag
             const exists = urls.some(u => (typeof u === 'string' ? u : u.url) === href);
             if (!exists) {
-                urls.push(forceClaude ? { url: href, forceClaude: true } : href);
+                urls.push(href);
             }
         }
     });
@@ -702,17 +733,11 @@
   async function autoSolveAndSubmit(state) {
     const total = state.quizUrls.length;
     const idx = state.currentIndex;
-    const currentQuizItem = state.quizUrls[idx];
-    let isClaudeForced = typeof currentQuizItem === 'object' && currentQuizItem.forceClaude;
 
     setStatus(`Quiz ${idx + 1} of ${total} — Opening...`);
 
     // Step A: Click Start / Resume / Retry if present
-    const isNativeRetry = await clickStartButton();
-    if (isNativeRetry && !isClaudeForced) {
-        console.log('[QuizAI] Natively detected a Retry button override. Upgrading to Claude!');
-        isClaudeForced = true;
-    }
+    await clickStartButton();
 
     // Step B: Wait for question blocks to actually appear in DOM
     setStatus(`Quiz ${idx + 1} of ${total} — Loading questions...`);
@@ -721,19 +746,11 @@
 
     // Step C: Solve all questions (Using Web UI logic now)
     setStatus(`Quiz ${idx + 1} of ${total} — Answering...`);
-    let success = false;
-
-    if (isClaudeForced) {
-      setStatus(`Quiz ${idx + 1} of ${total} — Retrying failed quiz with Claude...`);
-      success = await solveWithWebUI('claude');
-    } else {
-      success = await solveWithWebUI();
-      // Automatic Fallback to Claude if ChatGPT fails or times out
-      if (!success) {
-        setStatus(`⚠ Failed with preferred AI. Falling back to Claude...`);
-        await delay(2000);
-        success = await solveWithWebUI('claude');
-      }
+    const success = await solveWithSelectedProvider();
+    if (!success) {
+      await clearState();
+      if (!stopRequested) setStatus('⏸ No complete answer received. Select an AI provider and try again.');
+      return;
     }
 
     // Step D: Check honor code checkbox
@@ -1557,8 +1574,7 @@
     badge.setAttribute('data-cqs', '1');
 
     if (type === 'text') {
-      // Essay / reflection — show preview of typed answer
-      const preview = (result.suggestedText || result.reasoning || '').slice(0, 220);
+      const fullAnswer = result.suggestedText || result.reasoning || '';
       badge.innerHTML = `
         <div class="cqs-badge-header">
           <div class="cqs-badge-ai-icon">🤖</div>
@@ -1570,8 +1586,19 @@
         </div>
         <div class="cqs-suggested-wrap">
           <span class="cqs-suggested-label">ANSWER TYPED INTO BOX</span>
-          <div class="cqs-suggested-text">${preview}${preview.length === 220 ? '…' : ''}</div>
+          <div class="cqs-suggested-text"></div>
+          <button type="button" class="cqs-copy-answer">Copy answer</button>
         </div>`;
+      badge.querySelector('.cqs-suggested-text').textContent = fullAnswer;
+      badge.querySelector('.cqs-copy-answer').addEventListener('click', async (event) => {
+        const button = event.currentTarget;
+        try {
+          await navigator.clipboard.writeText(fullAnswer);
+          button.textContent = 'Copied!';
+        } catch {
+          button.textContent = 'Select the answer text to copy';
+        }
+      });
     } else {
       // MCQ / checkbox
       const pills = result.answers.map(l => {
@@ -1618,7 +1645,10 @@
         inp.focus();
         inp.innerHTML = '';
         document.execCommand('selectAll', false, null);
-        document.execCommand('insertText', false, answer);
+        const inserted = document.execCommand('insertText', false, answer);
+        if (!inserted || (inp.innerText || '').replace(/\r\n/g, '\n').trimEnd() !== answer.replace(/\r\n/g, '\n').trimEnd()) {
+          inp.textContent = answer;
+        }
         inp.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: answer }));
       } else {
         // Standard input[type=text] or textarea
@@ -1630,7 +1660,7 @@
         inp.select?.(); // select any existing text
         const inserted = document.execCommand('insertText', false, answer);
 
-        if (!inserted || !inp.value) {
+        if (!inserted || inp.value !== answer) {
           // Step 3: Fallback — use React's internal value setter
           const proto = inp instanceof HTMLTextAreaElement
             ? HTMLTextAreaElement.prototype
@@ -1699,12 +1729,18 @@
         position: fixed; bottom: 32px; right: 32px; z-index: 2147483647;
         background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(16px);
         border: 1px solid #e5e7eb; border-radius: 16px;
-        padding: 12px 20px; display: flex; align-items: center; gap: 16px;
+        padding: 12px 20px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+        max-width: calc(100vw - 64px);
         font-family: 'Inter', system-ui, -apple-system, sans-serif; font-size: 13.5px; color: #111827;
         box-shadow: 0 12px 32px rgba(0, 0, 0, 0.08), 0 2px 8px rgba(0,0,0,0.04);
         transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
         letter-spacing: -0.01em;
       }
+
+      .cqs-ai-controls { display: grid; grid-template-columns: auto auto; gap: 5px 8px; align-items: center; }
+      .cqs-ai-controls label { color: #4b5563; font-size: 11px; }
+      .cqs-ai-controls select { color: #111827; background: #fff; border: 1px solid #d1d5db; border-radius: 6px; padding: 5px; font: inherit; font-size: 12px; }
+      .cqs-copy-answer { margin-top: 8px; background: #fff; color: #065f46; border: 1px solid #a7f3d0; border-radius: 6px; padding: 6px 10px; cursor: pointer; font: inherit; font-size: 12px; }
       #cqs-toolbar:hover { transform: translateY(-2px); border-color: rgba(124, 58, 237, 0.3); }
 
       #cqs-toolbar .cqs-hub-logo { display: flex; align-items: center; gap: 8px; font-weight: 700; color: #111827; }
@@ -1758,7 +1794,7 @@
 
       .cqs-suggested-wrap { background: rgba(16, 185, 129, 0.05); border: 1px solid rgba(16, 185, 129, 0.2); border-radius: 10px; padding: 12px; margin-bottom: 12px; }
       .cqs-suggested-label { display: block; font-size: 10px; font-weight: 700; color: #10b981; margin-bottom: 4px; }
-      .cqs-suggested-text { font-size: 14.5px; color: #065f46; font-weight: 500; }
+      .cqs-suggested-text { font-size: 14.5px; color: #065f46; font-weight: 500; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 240px; overflow: auto; }
 
       .cqs-badge-logic { font-size: 13px; color: #4b5563; margin-top: 14px; padding-top: 14px; border-top: 1px solid #e5e7eb; line-height: 1.6; }
       .cqs-badge-logic span { color: #6b7280; font-weight: 700; font-size: 11px; }
@@ -1820,6 +1856,7 @@
     if (msg.type === 'TRIGGER_SOLVE_ALL') {
       // "Answer This Quiz Only" — click Start/Resume, wait for questions, solve, then submit
       (async () => {
+        stopRequested = false;
         setStatus('Opening quiz...');
         await clickStartButton();
 
@@ -1828,13 +1865,10 @@
         await delay(600);
 
         setStatus('Answering questions...');
-        let success = await solveWithWebUI();
-
-        // Automatic Fallback to Claude if ChatGPT fails or times out
+        const success = await solveWithSelectedProvider();
         if (!success) {
-          setStatus(`⚠ Failed with preferred AI. Falling back to Claude...`);
-          await delay(2000);
-          success = await solveWithWebUI('claude');
+          if (!stopRequested) setStatus('⏸ No complete answer received. Select an AI provider and try again.');
+          return;
         }
 
         setStatus('Checking honor pledge...');

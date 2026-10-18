@@ -10,6 +10,7 @@
 
     const TASK_KEY = 'cqsClaudeTask';
     const ANSWER_KEY = 'cqsClaudeAnswers';
+    let activeTaskId = null;
 
     // Module-level constant — must be here (not inside handleTask) to avoid TDZ errors
     // when isClaudeRetryMessage() is called before the const line executes.
@@ -21,19 +22,22 @@
 
     // ── Listen for new tasks when the tab is reused ───────────────────────────
     chrome.storage.onChanged.addListener((changes, namespace) => {
-        if (namespace === 'local' && changes[TASK_KEY]?.newValue) {
-            handleTask(changes[TASK_KEY].newValue);
+        if (namespace === 'local' && changes[TASK_KEY]) {
+            if (changes[TASK_KEY].newValue) handleTask(changes[TASK_KEY].newValue);
+            else activeTaskId = null;
         }
     });
 
     // ── Check for a pending task on initial load ──────────────────────────────
     const storage = await chrome.storage.local.get([TASK_KEY]);
-    if (storage[TASK_KEY]) {
+    if (storage[TASK_KEY] && !activeTaskId) {
         handleTask(storage[TASK_KEY]);
     }
 
     async function handleTask(task) {
-        if (!task?.prompt) return;
+        if (!task?.prompt || activeTaskId === task.taskId) return;
+        activeTaskId = task.taskId;
+        const deadline = task.deadline || Date.now() + CqsAI.DEFAULT_SETTINGS.responseTimeoutSeconds * 1000;
 
         console.log('[QuizAI Bridge] ✅ Task found. Prompt length:', task.prompt.length);
 
@@ -75,6 +79,7 @@
 
         const baselineEls = getAllResponseEls();
         const baselineCount = baselineEls.length;
+        const baselineNodes = new Set(baselineEls);
         const baselineLastText = baselineEls.length ? normalizeText(baselineEls[baselineEls.length - 1].innerText) : '';
         console.log('[QuizAI Bridge] Baseline captured. Count:', baselineCount, 'Last text len:', baselineLastText.length);
 
@@ -125,6 +130,8 @@
             'button[aria-label*="Send" i]',
         ], 5000);
 
+        if (activeTaskId !== task.taskId) return;
+
         if (sendBtn && !sendBtn.disabled) {
             console.log('[QuizAI Bridge] Clicking Send...');
             sendBtn.click();
@@ -138,33 +145,25 @@
         console.log('[QuizAI Bridge] Message sent. Waiting for NEW response elements...');
         await delay(3000); // give Claude time to start generating
 
-        // ── 6. Wait for a NEW response element to appear (not old sidebar text) ───────
-        const newEls = await waitFor(
-            () => {
-                const all = getAllResponseEls();
-                if (!all.length) return null;
-
-                if (baselineCount > 0 && all.length > baselineCount) return all;
-                if (baselineCount === 0 && all.length > 0) return all;
-                return null;
-            },
-            60000
-        );
-
-        if (!newEls) {
-            await storeError('Claude did not generate a response in time. Try again.');
+        let responseText;
+        try {
+            responseText = await CqsAI.waitForResponse(() => {
+                const fresh = getAllResponseEls().filter(el => !baselineNodes.has(el));
+                return fresh.map(el => el.innerText || '').join('\n\n').trim();
+            }, {
+                timeoutMs: deadline - Date.now(),
+                isProcessing: text => isClaudeRetryMessage(text) || !!document.querySelector(
+                    'button[aria-label*="Stop" i], button[data-testid="stop-button"], [data-is-streaming="true"], .font-claude-response[aria-busy="true"]'
+                ),
+                isComplete: text => CqsAI.hasCompleteAnswers(
+                    parseClaudeResponse(text, text.includes('"answers"')), task.expectedAnswers
+                ),
+                isCancelled: () => activeTaskId !== task.taskId,
+            });
+        } catch (error) {
+            if (activeTaskId === task.taskId) await storeError(error.message);
             return;
         }
-
-        console.log('[QuizAI Bridge] New response text detected.');
-
-        // ── 7. Wait for the NEW response text to stabilise ───────────────────────────
-        const responseText = await waitForStableText(() => {
-            const all = getAllResponseEls();
-            if (!all.length) return '';
-            // Just read the absolute last output block, immune to SPA unmounts
-            return (all[all.length - 1].innerText || '').trim();
-        }, 120000);
 
         console.log('[QuizAI Bridge] Stable response (', responseText.length, ' chars):', responseText.slice(0, 150));
 
@@ -175,12 +174,13 @@
 
         // ── 8. Parse and store ───────────────────────────────────────────────────────
         const answers = parseClaudeResponse(responseText);
+        if (activeTaskId !== task.taskId) return;
         console.log('[QuizAI Bridge] Parsed', answers.length, 'answers:', JSON.stringify(answers));
 
         await chrome.storage.local.set({
             [ANSWER_KEY]: {
                 answers,
-                rawText: responseText.slice(0, 5000),
+                rawText: responseText,
                 taskId: task.taskId,
                 timestamp: Date.now(),
             }
@@ -233,17 +233,6 @@
             }
         }
 
-        function waitFor(fn, maxMs) {
-            return new Promise(resolve => {
-                const r = fn(); if (r) { resolve(r); return; }
-                const start = Date.now();
-                const id = setInterval(() => {
-                    const r2 = fn();
-                    if (r2 || Date.now() - start > maxMs) { clearInterval(id); resolve(r2 || null); }
-                }, 600);
-            });
-        }
-
         // CLAUDE_RETRY_PHRASES is defined at module scope (top of file) to avoid TDZ errors.
 
         function isClaudeRetryMessage(text) {
@@ -251,42 +240,9 @@
             return CLAUDE_RETRY_PHRASES.some(re => re.test(text));
         }
 
-        function waitForStableText(getText, maxMs) {
-            return new Promise(resolve => {
-                let last = '', stableCount = 0;
-                const start = Date.now();
-                const id = setInterval(() => {
-                    const cur = getText();
-                    if (cur && cur === last && cur.length > 10) {
-                        if (isClaudeRetryMessage(cur)) {
-                            // Claude is retrying — reset and keep waiting
-                            stableCount = 0;
-                            last = ''; // force re-read next tick
-                            console.log('[QuizAI Bridge] Retry phrase detected, still waiting...', cur.slice(0, 80));
-                        } else {
-                            stableCount++;
-                            // Longer text (full answer) needs only 2 stable checks (~1.6s).
-                            // Shorter text needs 3 checks (~2.4s) to avoid locking onto partial streaming.
-                            const needed = cur.length > 300 ? 2 : 3;
-                            if (stableCount >= needed) { clearInterval(id); resolve(cur); return; }
-                        }
-                    } else {
-                        stableCount = 0; last = cur;
-                        if (cur && cur.includes('"answers"')) {
-                            const parsed = parseClaudeResponse(cur, true);
-                            if (parsed && parsed.answers && parsed.answers.length > 0) {
-                                clearInterval(id); resolve(cur); return;
-                            }
-                        }
-                    }
-                    if (Date.now() - start > maxMs) { clearInterval(id); resolve(last); }
-                }, 800);
-            });
-        }
-
         function parseClaudeResponse(text, skipRegexFallback = false) {
             // 1. Extract all complete JSON objects using brace-balancing
-            const candidates = extractJsonObjects(text);
+            const candidates = CqsAI.extractJsonObjects(text);
             // Try largest candidate first (most complete JSON blob)
             for (const candidate of [...candidates].reverse()) {
                 try {
@@ -310,7 +266,7 @@
                 } catch { /* try next */ }
             }
 
-            if (skipRegexFallback) return { answers: [] };
+            if (skipRegexFallback) return [];
 
             // 3. Regex extraction — handles both letter and open-ended text answers, plus scoreIndex for peer review
             const customRes = [];
@@ -364,26 +320,8 @@
             return result;
         }
 
-        // Extracts all complete top-level JSON objects by counting balanced braces
-        function extractJsonObjects(text) {
-            const results = [];
-            let depth = 0, start = -1;
-            for (let i = 0; i < text.length; i++) {
-                if (text[i] === '{') {
-                    if (depth === 0) start = i;
-                    depth++;
-                } else if (text[i] === '}') {
-                    depth--;
-                    if (depth === 0 && start !== -1) {
-                        results.push(text.slice(start, i + 1));
-                        start = -1;
-                    }
-                }
-            }
-            return results;
-        }
-
         async function storeError(msg) {
+            if (activeTaskId !== task.taskId) return;
             console.error('[QuizAI Bridge] ERROR:', msg);
             await chrome.storage.local.set({ [ANSWER_KEY]: { error: msg, taskId: task.taskId, timestamp: Date.now() } });
             await chrome.storage.local.remove([TASK_KEY]);
